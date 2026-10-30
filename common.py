@@ -19,20 +19,21 @@ class CaptchaRequired(Exception):
     pass
 
 
-def queue():
-    config.VIDEOS_DIR.mkdir(exist_ok=True)
-    files = [p for p in config.VIDEOS_DIR.iterdir() if p.suffix.lower() in config.VIDEO_EXTS]
+def queue(folder=None):
+    folder = folder or config.VIDEOS_DIR
+    folder.mkdir(exist_ok=True)
+    files = [p for p in folder.iterdir() if p.suffix.lower() in config.VIDEO_EXTS]
     return sorted(files, key=lambda p: p.stat().st_mtime)
 
 
-def description_for(video: Path) -> str:
+def description_for(video: Path, limit=config.MAX_DESCRIPTION) -> str:
     sidecar = video.with_suffix(".txt")
     if sidecar.exists():
         text = sidecar.read_text(encoding="utf-8").strip()
     else:
         title = video.stem.replace("_", " ").replace("-", " ").strip()
         text = config.DESCRIPTION_TEMPLATE.format(title=title)
-    return text[: config.MAX_DESCRIPTION]
+    return text[:limit] if limit else text
 
 
 def _history():

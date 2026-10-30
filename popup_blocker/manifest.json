@@ -1,0 +1,8 @@
+{
+  "manifest_version": 3,
+  "name": "sxyprn popup blocker",
+  "version": "1.0",
+  "description": "Closes tabs opened by sxyprn pages and undoes ad redirects in the same tab.",
+  "permissions": ["tabs"],
+  "background": { "service_worker": "background.js" }
+}

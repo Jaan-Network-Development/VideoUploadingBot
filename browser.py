@@ -1,6 +1,9 @@
 """Shared browser setup: persistent profile, uBlock Origin Lite, devtools helpers."""
 import json
 import os
+import shutil
+import socket
+import time
 
 import config
 
@@ -10,6 +13,36 @@ DEVTOOLS_ENABLER_JS = """
 Object.defineProperty(window, 'outerWidth',  {get: () => window.innerWidth});
 Object.defineProperty(window, 'outerHeight', {get: () => window.innerHeight});
 """
+
+
+CHROME_CANDIDATES = [
+    r"C:\Program Files\Google\Chrome\Application\chrome.exe",
+    r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
+    os.path.expandvars(r"%LOCALAPPDATA%\Google\Chrome\Application\chrome.exe"),
+    r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
+    shutil.which("google-chrome") or "",
+    shutil.which("chromium") or "",
+]
+
+
+def find_chrome():
+    for path in CHROME_CANDIDATES:
+        if path and os.path.exists(path):
+            return path
+    raise SystemExit("Chrome/Edge not found; edit CHROME_CANDIDATES in browser.py")
+
+
+def wait_port(port, timeout=20):
+    end = time.time() + timeout
+    while time.time() < end:
+        with socket.socket() as s:
+            if s.connect_ex(("127.0.0.1", port)) == 0:
+                return
+        time.sleep(0.3)
+    raise SystemExit(
+        "Chrome opened but not with the debug port. A Chrome using the same profile is probably "
+        "already running: close ALL Chrome windows (check Task Manager) and run again."
+    )
 
 
 def load_env():
