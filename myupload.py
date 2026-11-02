@@ -1,6 +1,7 @@
 """Upload a folder's videos to myupload.us, then write 5 random links into each .txt.
 
-Usage: python myupload.py [folder]   (key in .env as MYUPLOAD_API_KEY)
+After the links are written it continues straight into upload_manual (the site upload).
+Usage: python myupload.py [folder]   (key in .env as MYUPLOAD_API_KEY; close all Chrome windows first)
 Links are cached in <folder>/myupload_links.json so a re-run never uploads twice.
 """
 import hashlib
@@ -158,6 +159,14 @@ def prepare(folder: Path):
         write_links(folder, items)
 
 
+def main(folder: Path):
+    """Upload to myupload, write the links, then post the folder to the site."""
+    prepare(folder)
+    import upload_manual   # imported here: it pulls in playwright
+    upload_manual.open_chrome()
+    upload_manual.process_queue(folder)
+
+
 if __name__ == "__main__":
     import sys
-    prepare(Path(sys.argv[1]) if len(sys.argv) > 1 else pick_folder())
+    main(Path(sys.argv[1]) if len(sys.argv) > 1 else pick_folder())
