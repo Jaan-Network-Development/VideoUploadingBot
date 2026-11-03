@@ -20,6 +20,7 @@ VIDEO_EXTS = {".mp4", ".mov", ".mkv", ".avi", ".webm", ".f4v", ".m4v"}
 DESCRIPTION_TEMPLATE = "{title}"
 MAX_DESCRIPTION = 500          # the textarea limit on the site
 
-DAILY_LIMIT = 5                # stop after this many uploads per 24h
-DELAY_BETWEEN_UPLOADS = (6, 15)   # random seconds between uploads (10-25 min)
+DAILY_LIMIT = 10               # stop after this many uploads per 24h
+DELAY_BETWEEN_UPLOADS = (15, 20)   # random seconds between uploads
+ACTION_DELAY = (1.0, 4.5)          # random seconds before each automated step (kept under 5s)
 UPLOAD_TIMEOUT = 60 * 60       # seconds to wait for a single upload

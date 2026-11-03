@@ -9,8 +9,10 @@ Cloudflare is verifying.
 """
 import json
 import os
+import random
 import subprocess
 import sys
+import time
 
 from playwright.sync_api import sync_playwright
 
@@ -43,17 +45,33 @@ def restore_session():
     return ok
 
 
+def pause():
+    time.sleep(random.uniform(*config.ACTION_DELAY))
+
+
+def site_page(ctx):
+    """The site's own tab (ads and extension welcome pages are other tabs)."""
+    host = config.BASE_URL.split("//", 1)[1]
+    return next((pg for pg in ctx.pages if host in pg.url), None)
+
+
 def open_login_form(login, password):
     with sync_playwright() as p:
         b = p.chromium.connect_over_cdp(f"http://127.0.0.1:{PORT}")
         ctx = b.contexts[0]
-        page = next((pg for pg in ctx.pages if "sxyprn" in pg.url), ctx.pages[0])
+        page = site_page(ctx)
+        if page is None:
+            page = ctx.pages[0]
+            page.goto(config.POST_PAGE)
         print(f"   Using tab: {page.url}")
         # the "Add your post" bar opens pop-up ads on the first clicks; close them and retry
         for attempt in range(1, 21):
             for extra in ctx.pages:
                 if extra != page:
                     extra.close()
+            if config.BASE_URL.split("//", 1)[1] not in page.url:
+                # an ad redirected the site's tab itself; go back
+                page.goto(config.POST_PAGE)
             page.bring_to_front()
             if page.is_visible("#lin_email"):
                 break
@@ -77,12 +95,12 @@ def open_login_form(login, password):
 
 def click_login_until_ok():
     while True:
-        input("3. Tick the Cloudflare box in the form. When it says Success, press Enter here "
-              "and the bot will click Login... ")
+        print("3. Tick the Cloudflare box in the form if it asks; the bot clicks Login automatically...")
+        pause()
         with sync_playwright() as p:
             b = p.chromium.connect_over_cdp(f"http://127.0.0.1:{PORT}")
             ctx = b.contexts[0]
-            page = ctx.pages[0]
+            page = site_page(ctx) or ctx.pages[0]
             try:
                 page.click("#modal_lin_btn", timeout=5000)
                 page.wait_for_timeout(4000)
@@ -94,7 +112,8 @@ def click_login_until_ok():
             b.close()
         if ok:
             return
-        print("   The site still sees you as logged out (wrong password or check not finished).")
+        print("   The site still sees you as logged out (wrong password or check not finished); retrying.")
+        pause()
 
 
 def main():
@@ -118,8 +137,8 @@ def main():
         if restore_session():
             print("Already logged in (saved session still valid).")
         else:
-            print("1. In the Chrome window, wait until the site loads.")
-            input("   Then press Enter here, and the bot will open the login form... ")
+            print("1. Waiting for the site to load, then opening the login form...")
+            pause()
             open_login_form(login, password)
             click_login_until_ok()
             print(f"Logged in OK. Saved {config.STATE_FILE}")

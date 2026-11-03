@@ -10,7 +10,9 @@ Usage: python upload_manual.py   (log in first with login.py, which also continu
 """
 import json
 import random
+import shutil
 import subprocess
+import sys
 import time
 
 from playwright.sync_api import sync_playwright
@@ -25,11 +27,19 @@ CAPTCHA_POLL_S = 5
 
 
 def copy_to_clipboard(text):
-    subprocess.run(
+    commands = [
         ["powershell", "-NoProfile", "-Command",
          "[Console]::InputEncoding=[Text.Encoding]::UTF8; Set-Clipboard -Value ([Console]::In.ReadToEnd())"],
-        input=text.encode("utf-8"), check=True,
-    )
+        ["wl-copy"],
+        ["xclip", "-selection", "clipboard"],
+        ["xsel", "--clipboard", "--input"],
+    ]
+    for cmd in commands:
+        if shutil.which(cmd[0]):
+            subprocess.run(cmd, input=text.encode("utf-8"), check=True)
+            return
+    print("No clipboard tool found (install xclip: sudo apt install xclip). Description:")
+    print(text)
 
 
 def open_chrome():
@@ -64,7 +74,11 @@ def open_chrome():
 
 def site_page(ctx):
     """The sxyprn tab, with any ad tabs closed."""
-    page = next((pg for pg in ctx.pages if "sxyprn" in pg.url), ctx.pages[0])
+    host = config.BASE_URL.split("//", 1)[1]
+    page = next((pg for pg in ctx.pages if host in pg.url), None)
+    if page is None:   # an ad hijacked the site's tab: reuse a tab and go back
+        page = ctx.pages[0]
+        page.goto(config.POST_PAGE, wait_until="domcontentloaded")
     for extra in ctx.pages:
         if extra != page:
             extra.close()
@@ -72,19 +86,41 @@ def site_page(ctx):
     return page
 
 
+def set_file(page, selector, path):
+    """Attach a file over raw CDP: set_input_files refuses files over 50 MB on a CDP connection."""
+    cdp = page.context.new_cdp_session(page)
+    try:
+        root = cdp.send("DOM.getDocument")["root"]["nodeId"]
+        node = cdp.send("DOM.querySelector", {"nodeId": root, "selector": selector})["nodeId"]
+        cdp.send("DOM.setFileInputFiles", {"nodeId": node, "files": [str(path)]})
+    finally:
+        cdp.detach()
+
+
 def attach_and_fill(video, description):
     """Expand the post box, fill the description, attach the video; then disconnect."""
     with sync_playwright() as p:
         b = p.chromium.connect_over_cdp(f"http://127.0.0.1:{PORT}")
-        page = site_page(b.contexts[0])
-        page.goto(config.POST_PAGE, wait_until="domcontentloaded")
-        try:
-            page.wait_for_selector(".addpost_text", state="attached", timeout=15000)
-        except Exception:
-            raise RuntimeError("post form not found - session expired? run login.py")
-        page.click(".addpost_text")  # expands the box (ad tabs are closed by the next check)
-        page.fill(".addpost_text", description)
-        page.set_input_files("#addpost_vid_file", str(video))
+        # the first clicks open pop-up ads (or redirect the tab); close them and retry
+        for attempt in range(1, 6):
+            page = site_page(b.contexts[0])
+            try:
+                page.goto(config.POST_PAGE, wait_until="domcontentloaded")
+                try:
+                    page.wait_for_selector(".addpost_text", state="attached", timeout=15000)
+                except Exception:
+                    raise RuntimeError("post form not found - session expired? run login.py")
+                page.click(".addpost_text", timeout=10000)  # expands the box
+                site_page(b.contexts[0])  # close ad tabs the click opened
+                page.fill(".addpost_text", description, timeout=10000)
+                set_file(page, "#addpost_vid_file", video)
+                break
+            except RuntimeError:
+                raise
+            except Exception as e:  # noqa: BLE001
+                print(f"  ad interfered (attempt {attempt}/5): {e!r:.200}")
+                if attempt == 5:
+                    raise
         page.wait_for_function(
             "() => typeof wantLoadVideoFile !== 'undefined' && wantLoadVideoFile === true",
             timeout=15000,
@@ -145,8 +181,12 @@ def upload_auto(video, description):
 def manual_fallback(video, description):
     """Returns the answer: '' uploaded, 's' skip, 'f' failed, 'q' quit."""
     copy_to_clipboard(description)
-    # one string, path quoted: a list makes Explorer fall back to Documents when the name has spaces
-    subprocess.Popen(f'explorer /select,"{video}"')
+    if sys.platform.startswith("win"):
+        # one string, path quoted: a list makes Explorer fall back to Documents when the name has spaces
+        subprocess.Popen(f'explorer /select,"{video}"')
+    elif shutil.which("xdg-open"):
+        subprocess.Popen(["xdg-open", str(video.parent)])
+    print(f"  File: {video}")
     print("  Description copied to clipboard. In Chrome: click the post box, paste (Ctrl+V), "
           "Attach the file, tick the captcha, Send.")
     while True:
