@@ -54,6 +54,7 @@ def open_chrome():
         f"--remote-debugging-port={PORT}",
         f"--user-data-dir={config.ROOT / 'login_profile'}",
         "--no-first-run", "--no-default-browser-check",
+        *browser.server_flags(),
         config.POST_PAGE,
     ])
     browser.wait_port(PORT)
@@ -109,6 +110,12 @@ def attach_and_fill(video, description):
                 try:
                     page.wait_for_selector(".addpost_text", state="attached", timeout=15000)
                 except Exception:
+                    shot = config.ROOT / "last_failure.png"
+                    try:
+                        page.screenshot(path=str(shot))
+                    except Exception:  # noqa: BLE001
+                        pass
+                    print(f"  page: {page.url!r} title: {page.title()!r} (screenshot: {shot})")
                     raise RuntimeError("post form not found - session expired? run login.py")
                 page.click(".addpost_text", timeout=10000)  # expands the box
                 site_page(b.contexts[0])  # close ad tabs the click opened
@@ -180,6 +187,9 @@ def upload_auto(video, description):
 
 def manual_fallback(video, description):
     """Returns the answer: '' uploaded, 's' skip, 'f' failed, 'q' quit."""
+    if not sys.stdin.isatty():   # running as a service: nobody to ask, retry on the next pass
+        print("  No terminal to ask; leaving this video in the queue for the next pass.")
+        return "s"
     copy_to_clipboard(description)
     if sys.platform.startswith("win"):
         # one string, path quoted: a list makes Explorer fall back to Documents when the name has spaces
@@ -196,14 +206,15 @@ def manual_fallback(video, description):
 
 
 def process_queue(folder=None):
+    """Post every pending video in folder. Returns False when the whole run should stop."""
     videos = common.queue(folder)
+    skipped = len(common.queue(folder, include_uploaded=True)) - len(videos)
+    if skipped:
+        print(f"{skipped} video(s) already uploaded before, skipping them.")
     if not videos:
-        print(f"No videos in {config.VIDEOS_DIR}")
-        return
+        print(f"No new videos in {folder or config.VIDEOS_DIR}")
+        return True
     for video in videos:
-        if common.uploads_last_24h() >= config.DAILY_LIMIT:
-            print("Daily cap from config reached, stopping.")
-            return
         description = common.description_for(video)
         print(f"\nUploading {video.name} ...")
         try:
@@ -211,33 +222,49 @@ def process_queue(folder=None):
             answer = ""
         except (common.DailyLimitReached, common.NotApproved) as e:
             print(f"Stopping: {e!r}")
-            return
+            return False
         except Exception as e:  # noqa: BLE001
             print(f"  Automatic upload failed ({e!r}); doing this one by hand.")
             answer = manual_fallback(video, description)
         if answer == "q":
-            return
+            return False
         if answer == "s":
             continue
         if answer == "f":
             common.finish(video, ok=False)
             continue
-        common.record_upload()
+        common.record_upload(video)
         common.finish(video, ok=True)
         print("  done")
-        if video != videos[-1]:
-            lo, hi = config.DELAY_BETWEEN_UPLOADS
-            wait = random.randint(lo, hi)
-            print(f"  next video in {wait}s (Ctrl+C to skip the wait)")
-            try:
-                time.sleep(wait)
-            except KeyboardInterrupt:
-                pass
+        wait = random.uniform(*config.DELAY_BETWEEN_UPLOADS)
+        print(f"  next video in {wait:.0f}s (Ctrl+C to skip the wait)")
+        try:
+            time.sleep(wait)
+        except KeyboardInterrupt:
+            pass
+    return True
+
+
+def process_all(prepare=None):
+    """Go through every model folder in turn; prepare(folder) runs before each one.
+
+    Returns False if the run was stopped (site limit, account not approved, quit)."""
+    for folder in common.folders():
+        print(f"\n=== {folder.name} ===")
+        if prepare:
+            prepare(folder)
+        if not process_queue(folder):
+            return False
+        if folder != config.VIDEOS_DIR and not common.queue(folder):
+            common.record_actress_done(folder.name)
+            print(f"{folder.name}: all videos uploaded.")
+    print("\nAll folders done.")
+    return True
 
 
 def main():
     open_chrome()
-    process_queue()
+    process_all()
 
 
 if __name__ == "__main__":

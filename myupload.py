@@ -1,7 +1,7 @@
 """Upload a folder's videos to myupload.us, then write 5 random links into each .txt.
 
 After the links are written it continues straight into upload_manual (the site upload).
-Usage: python myupload.py [folder]   (key in .env as MYUPLOAD_API_KEY; close all Chrome windows first)
+Usage: python myupload.py [folder | --pick]  (no argument: every folder in turn)   (key in .env as MYUPLOAD_API_KEY; close all Chrome windows first)
 Links are cached in <folder>/myupload_links.json so a re-run never uploads twice.
 """
 import hashlib
@@ -21,6 +21,8 @@ API = "https://myupload.us/api/v1"
 LINKS_PER_TXT = 5
 CACHE_NAME = "myupload_links.json"
 READY_WAIT_S = 15 * 60
+WATCH_INTERVAL_S = 5 * 60      # service mode: pause between scans for new downloads
+STOPPED_RETRY_S = 60 * 60      # service mode: pause after the site refused (limit / not approved)
 
 
 def api_key():
@@ -57,7 +59,7 @@ def upload_video(client, video: Path, salt=""):
             r = client.post(
                 f"{API}/videos",
                 headers={"Idempotency-Key": idem},
-                data={"title": video.stem},   # text fields go before the file
+                data={"title": common.title_for(video)},   # text fields go before the file
                 files={"file": (video.name, f)},
             )
         if r.status_code == 429:
@@ -134,16 +136,15 @@ def write_links(folder: Path, items):
         base = "\n".join(l for l in base.splitlines() if l.strip() not in {i["url"] for i in items.values()}).strip()
         tail = "\n".join(links)
         room = config.MAX_DESCRIPTION - len(tail) - 1
-        base = base[:max(room, 0)].rstrip()
+        base = common._fit(base, max(room, 0))
         text = f"{base}\n{tail}" if base else tail
         video.with_suffix(".txt").write_text(text, encoding="utf-8")
         print(f"{video.name}: wrote {len(links)} links")
 
 
 def pick_folder() -> Path:
-    config.VIDEOS_DIR.mkdir(exist_ok=True)
-    subs = sorted(p for p in config.VIDEOS_DIR.iterdir() if p.is_dir())
-    if not subs:
+    subs = common.folders()
+    if subs == [config.VIDEOS_DIR]:
         return config.VIDEOS_DIR
     for n, p in enumerate(subs, 1):
         print(f"{n}. {p.name} ({len(common.queue(p))} videos)")
@@ -159,14 +160,32 @@ def prepare(folder: Path):
         write_links(folder, items)
 
 
-def main(folder: Path):
-    """Upload to myupload, write the links, then post the folder to the site."""
-    prepare(folder)
+def main(folder: Path = None, watch=False):
+    """Upload to myupload, write the links, then post to the site: one folder, or all in turn.
+
+    watch: keep running, rescanning for new downloads (what the service does).
+    """
     import upload_manual   # imported here: it pulls in playwright
     upload_manual.open_chrome()
-    upload_manual.process_queue(folder)
+    if folder:
+        prepare(folder)
+        upload_manual.process_queue(folder)
+        return
+    while True:
+        finished = upload_manual.process_all(prepare)
+        if not watch:
+            return
+        # after a clean pass wait for new downloads; after a stop (limit / not approved) wait longer
+        wait = WATCH_INTERVAL_S if finished else STOPPED_RETRY_S
+        print(f"Sleeping {wait // 60} min before checking for new videos ...", flush=True)
+        time.sleep(wait)
 
 
 if __name__ == "__main__":
     import sys
-    main(Path(sys.argv[1]) if len(sys.argv) > 1 else pick_folder())
+    # no argument: every folder in turn; --pick: choose one; --watch: all folders, forever
+    arg = sys.argv[1] if len(sys.argv) > 1 else None
+    if arg == "--pick":
+        main(pick_folder())
+    else:
+        main(Path(arg) if arg and arg != "--watch" else None, watch=arg == "--watch")

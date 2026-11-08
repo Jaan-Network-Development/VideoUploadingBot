@@ -1,0 +1,11 @@
+[Unit]
+Description=VNC view of the VideoBot display (localhost only, reach it through an SSH tunnel)
+After=xvfb.service
+Requires=xvfb.service
+
+[Service]
+ExecStart=/usr/bin/x11vnc -display :99 -localhost -forever -shared -nopw -rfbport 5900
+Restart=always
+
+[Install]
+WantedBy=multi-user.target

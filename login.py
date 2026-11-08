@@ -130,6 +130,7 @@ def main():
            f"--load-extension={config.ADBLOCK_DIR}"] if adblock else []),
         "--no-first-run",
         "--no-default-browser-check",
+        *browser.server_flags(),
         config.POST_PAGE,
     ])
     try:
@@ -146,7 +147,7 @@ def main():
         proc.terminate()
         raise
     # Chrome stays open and continues straight into the upload queue (same window, no restart)
-    upload_manual.process_queue()
+    upload_manual.process_all()
 
 
 if __name__ == "__main__":

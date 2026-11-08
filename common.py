@@ -1,5 +1,6 @@
 import json
 import random
+import re
 import shutil
 import time
 from pathlib import Path
@@ -19,44 +20,146 @@ class CaptchaRequired(Exception):
     pass
 
 
-def queue(folder=None):
+def queue(folder=None, include_uploaded=False):
+    """Videos in folder, oldest first, minus those already posted."""
     folder = folder or config.VIDEOS_DIR
     folder.mkdir(exist_ok=True)
     files = [p for p in folder.iterdir() if p.suffix.lower() in config.VIDEO_EXTS]
+    if not include_uploaded:
+        done = _uploaded()
+        files = [p for p in files if video_key(p) not in done]
     return sorted(files, key=lambda p: p.stat().st_mtime)
+
+
+def folders():
+    """Every model folder under VIDEOS_DIR, in name order (VIDEOS_DIR itself if it has none)."""
+    config.VIDEOS_DIR.mkdir(exist_ok=True)
+    subs = sorted(p for p in config.VIDEOS_DIR.iterdir() if p.is_dir())
+    return subs or [config.VIDEOS_DIR]
+
+
+def _meta(video: Path) -> dict:
+    """The <name>.json next to the video (title, actresses, categories), or {}."""
+    try:
+        data = json.loads(video.with_suffix(".json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def title_for(video: Path) -> str:
+    """'<first actress> - <title>' from the json, else the filename."""
+    meta = _meta(video)
+    title = str(meta.get("title") or "").strip()
+    if not title:
+        return video.stem.replace("_", " ").replace("-", " ").strip()
+    actresses = meta.get("actresses") or []
+    actress = str(actresses[0]).strip() if actresses else ""
+    if actress and not title.lower().startswith(actress.lower()):
+        return f"{actress} - {title}"
+    return title
+
+
+def hashtags_for(video: Path) -> list:
+    tags = []
+    for cat in _meta(video).get("categories") or []:
+        tag = "#" + re.sub(r"[^0-9A-Za-z]", "", str(cat))
+        if len(tag) > 1 and tag not in tags:
+            tags.append(tag)
+    return tags
+
+
+def _fit(text: str, limit) -> str:
+    """Cut to limit without leaving half a word or hashtag at the end."""
+    if not limit or len(text) <= limit:
+        return text
+    cut = text[:limit]
+    if not text[limit].isspace():
+        cut = cut.rsplit(None, 1)[0] if len(cut.split()) > 1 else cut
+    return cut.rstrip()
 
 
 def description_for(video: Path, limit=config.MAX_DESCRIPTION) -> str:
     sidecar = video.with_suffix(".txt")
     if sidecar.exists():
         text = sidecar.read_text(encoding="utf-8").strip()
+    elif _meta(video):
+        text = "\n".join(filter(None, [title_for(video), " ".join(hashtags_for(video))]))
     else:
         title = video.stem.replace("_", " ").replace("-", " ").strip()
         text = config.DESCRIPTION_TEMPLATE.format(title=title)
-    return text[:limit] if limit else text
+    return _fit(text, limit)
 
 
-def _history():
+def video_key(video: Path) -> str:
+    """The site id from the json when there is one, else the file name."""
+    return str(_meta(video).get("id") or video.name)
+
+
+def _state_file() -> Path:
+    return config.VIDEOS_DIR / "state.json"
+
+
+def _read_state() -> dict:
     try:
-        return json.loads(config.HISTORY_FILE.read_text())
+        data = json.loads(_state_file().read_text(encoding="utf-8"))
     except (OSError, ValueError):
-        return []
+        return {}
+    return data if isinstance(data, dict) else {}
 
 
-def uploads_last_24h() -> int:
-    cutoff = time.time() - 86400
-    return sum(1 for t in _history() if t > cutoff)
+def _write_state(state: dict):
+    """Rewrite state.json atomically; keys we don't own (done_videos, done_actresses) stay untouched."""
+    config.VIDEOS_DIR.mkdir(parents=True, exist_ok=True)
+    tmp = _state_file().with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(state, indent=1, ensure_ascii=False), encoding="utf-8")
+    tmp.replace(_state_file())
 
 
-def record_upload():
-    h = [t for t in _history() if t > time.time() - 86400] + [time.time()]
-    config.HISTORY_FILE.write_text(json.dumps(h))
+def _uploaded() -> dict:
+    """Ids of videos already posted (state.json 'uploaded_videos')."""
+    up = _read_state().get("uploaded_videos")
+    return up if isinstance(up, dict) else {}
+
+
+def record_upload(video: Path):
+    """Remember a posted video in state.json so it is never uploaded again (call before finish deletes it)."""
+    state = _read_state()
+    up = state.get("uploaded_videos")
+    if not isinstance(up, dict):
+        up = {}
+    up[video_key(video)] = {
+        "file": video.name,
+        "title": title_for(video),
+        "actress": video.parent.name if video.parent != config.VIDEOS_DIR else "",
+        "time": time.strftime("%Y-%m-%d %H:%M:%S"),
+    }
+    state["uploaded_videos"] = up
+    _write_state(state)
+
+
+def record_actress_done(name: str):
+    """Mark an actress folder as fully uploaded in state.json 'uploaded_actresses'."""
+    state = _read_state()
+    lst = state.get("uploaded_actresses")
+    if not isinstance(lst, list):
+        lst = []
+    if name not in lst:
+        lst.append(name)
+    state["uploaded_actresses"] = lst
+    _write_state(state)
 
 
 def finish(video: Path, ok: bool):
+    if ok and config.DELETE_AFTER_UPLOAD:
+        for f in (video, video.with_suffix(".txt"), video.with_suffix(".json")):
+            f.unlink(missing_ok=True)
+        return
     dest_dir = config.DONE_DIR if ok else config.FAILED_DIR
-    dest_dir.mkdir(exist_ok=True)
-    for f in (video, video.with_suffix(".txt")):
+    if video.parent != config.VIDEOS_DIR:
+        dest_dir = dest_dir / video.parent.name   # keep the model folder, names can repeat
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    for f in (video, video.with_suffix(".txt"), video.with_suffix(".json")):
         if f.exists():
             shutil.move(str(f), dest_dir / f.name)
 
@@ -68,9 +171,6 @@ def pause():
 def run_queue(upload_one):
     """upload_one(video, description) -> None, raises on failure."""
     for video in queue():
-        if uploads_last_24h() >= config.DAILY_LIMIT:
-            print("Daily cap from config reached, stopping.")
-            return
         print(f"Uploading {video.name} ...")
         try:
             upload_one(video, description_for(video))
@@ -81,7 +181,7 @@ def run_queue(upload_one):
             print(f"Failed {video.name}: {e!r}")
             finish(video, ok=False)
             continue
-        record_upload()
+        record_upload(video)
         finish(video, ok=True)
         print("  done")
         pause()

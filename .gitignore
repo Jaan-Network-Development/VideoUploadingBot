@@ -8,6 +8,7 @@ login_profile/
 
 # Runtime state
 history.json
+uploaded.json
 videos/
 done/
 failed/
@@ -27,3 +28,4 @@ venv/
 .idea/
 .DS_Store
 Thumbs.db
+last_failure.png

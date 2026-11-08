@@ -32,6 +32,13 @@ def find_chrome():
     raise SystemExit("Chrome/Edge not found; edit CHROME_CANDIDATES in browser.py")
 
 
+def server_flags():
+    """Chrome needs these on a headless Linux server (it runs as root under a virtual display)."""
+    if os.name == "posix" and os.geteuid() == 0:
+        return ["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu"]
+    return []
+
+
 def wait_port(port, timeout=20):
     end = time.time() + timeout
     while time.time() < end:
