@@ -6,7 +6,7 @@ POST_PAGE = f"{BASE_URL}/blog/all/0.html"
 
 ROOT = Path(__file__).parent
 # one subfolder per model, each holding <id>-<name>.mp4 plus <id>-<name>.json metadata
-VIDEOS_DIR = Path(os.environ.get("VIDEOBOT_DOWNLOADS", "/var/lib/videobot/downloads"))
+VIDEOS_DIR = Path(os.environ.get("VIDEOBOT_DOWNLOADS", "/var/lib/videobot/upload_downloads"))
 DONE_DIR = ROOT / "done"
 FAILED_DIR = ROOT / "failed"
 DELETE_AFTER_UPLOAD = True     # delete the video, .txt and .json once posted (False: move to DONE_DIR)
