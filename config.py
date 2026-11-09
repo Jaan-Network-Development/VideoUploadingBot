@@ -27,3 +27,6 @@ MAX_DESCRIPTION = 500          # the textarea limit on the site
 DELAY_BETWEEN_UPLOADS = (15, 20)   # random seconds between uploads
 ACTION_DELAY = (1.0, 4.5)          # random seconds before each automated step (kept under 5s)
 UPLOAD_TIMEOUT = 60 * 60       # seconds to wait for a single upload
+
+IDLE_POLL_S = 60               # when the folder is empty, look again after this many seconds
+RETRY_AFTER_STOP_S = 30 * 60   # after a daily limit / not-approved stop, wait this long before retrying

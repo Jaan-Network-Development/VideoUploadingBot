@@ -116,6 +116,17 @@ def click_login_until_ok():
         pause()
 
 
+def ensure_logged_in(login, password):
+    if restore_session():
+        print("Already logged in (saved session still valid).")
+        return
+    print("1. Waiting for the site to load, then opening the login form...")
+    pause()
+    open_login_form(login, password)
+    click_login_until_ok()
+    print(f"Logged in OK. Saved {config.STATE_FILE}")
+
+
 def main():
     browser.load_env()
     login, password = os.environ.get("SITE_LOGIN"), os.environ.get("SITE_PASSWORD")
@@ -135,19 +146,31 @@ def main():
     ])
     try:
         browser.wait_port(PORT)
-        if restore_session():
-            print("Already logged in (saved session still valid).")
-        else:
-            print("1. Waiting for the site to load, then opening the login form...")
-            pause()
-            open_login_form(login, password)
-            click_login_until_ok()
-            print(f"Logged in OK. Saved {config.STATE_FILE}")
+        ensure_logged_in(login, password)
     except BaseException:
         proc.terminate()
         raise
-    # Chrome stays open and continues straight into the upload queue (same window, no restart)
-    upload_manual.process_all()
+    # Chrome stays open and continues straight into the upload queue (same window, no restart).
+    # The service never exits when the folder is empty: the download service keeps adding
+    # videos, so wait and look again.
+    try:
+        while True:
+            try:
+                finished = upload_manual.process_all()
+            except Exception as e:  # noqa: BLE001
+                print(f"Pass failed ({e!r}); retrying later.")
+                finished = False
+            if upload_manual.QUIT:
+                break
+            wait = config.IDLE_POLL_S if finished else config.RETRY_AFTER_STOP_S
+            print(f"\nWaiting {wait // 60} min for new videos (Ctrl+C to stop)...")
+            time.sleep(wait)
+            try:
+                ensure_logged_in(login, password)
+            except Exception as e:  # noqa: BLE001
+                print(f"Login check failed ({e!r}); will retry.")
+    except KeyboardInterrupt:
+        print("Stopped.")
 
 
 if __name__ == "__main__":

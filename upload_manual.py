@@ -24,6 +24,7 @@ import config
 PORT = 9222
 CAPTCHA_WAIT_S = 5 * 60
 CAPTCHA_POLL_S = 5
+QUIT = False   # set when you answer 'q' at the manual prompt
 
 
 def copy_to_clipboard(text):
@@ -227,6 +228,8 @@ def process_queue(folder=None):
             print(f"  Automatic upload failed ({e!r}); doing this one by hand.")
             answer = manual_fallback(video, description)
         if answer == "q":
+            global QUIT
+            QUIT = True
             return False
         if answer == "s":
             continue
