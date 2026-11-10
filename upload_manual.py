@@ -23,7 +23,7 @@ import config
 
 PORT = 9222
 CAPTCHA_WAIT_S = 5 * 60
-CAPTCHA_POLL_S = 5
+CAPTCHA_POLL_S = 20
 QUIT = False   # set when you answer 'q' at the manual prompt
 
 
@@ -137,9 +137,41 @@ def attach_and_fill(video, description):
         b.close()  # disconnect so Cloudflare verifies without automation attached
 
 
+def _raw_cdp_eval(expression):
+    """Evaluate JS in the site's tab over a bare CDP websocket.
+
+    No Playwright attach, no Runtime.enable, no tab focus/close: Cloudflare's check
+    is far less likely to notice this than a full Playwright reconnect.
+    Returns None if the lightweight route is unavailable."""
+    try:
+        import urllib.request
+        import websocket   # pip install websocket-client
+    except ImportError:
+        return None
+    host = config.BASE_URL.split("//", 1)[1]
+    try:
+        tabs = json.loads(urllib.request.urlopen(f"http://127.0.0.1:{PORT}/json", timeout=5).read())
+        tab = next(t for t in tabs if t.get("type") == "page" and host in t.get("url", ""))
+        ws = websocket.create_connection(tab["webSocketDebuggerUrl"], timeout=10)
+        try:
+            ws.send(json.dumps({"id": 1, "method": "Runtime.evaluate",
+                                "params": {"expression": expression, "returnByValue": True}}))
+            while True:
+                msg = json.loads(ws.recv())
+                if msg.get("id") == 1:
+                    return msg["result"]["result"].get("value")
+        finally:
+            ws.close()
+    except Exception:  # noqa: BLE001
+        return None
+
+
 def captcha_passed():
-    """Brief reconnect: has the Cloudflare check finished? (Also closes ad tabs.)"""
-    with sync_playwright() as p:
+    """Has the Cloudflare check finished? Prefer the quiet raw-CDP poll."""
+    needed = _raw_cdp_eval("typeof recap_ok !== 'undefined' && !recap_ok")
+    if needed is not None:
+        return not needed
+    with sync_playwright() as p:   # fallback: full reconnect (noisier)
         b = p.chromium.connect_over_cdp(f"http://127.0.0.1:{PORT}")
         page = site_page(b.contexts[0])
         needed = page.evaluate("() => typeof recap_ok !== 'undefined' && !recap_ok")
