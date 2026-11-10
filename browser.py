@@ -33,10 +33,35 @@ def find_chrome():
 
 
 def server_flags():
-    """Chrome needs these on a headless Linux server (it runs as root under a virtual display)."""
+    """Extra Chrome flags for a Linux VPS.
+
+    --no-sandbox is only added when running as root (run as a normal user to avoid it).
+    --disable-gpu is deliberately NOT used: it makes WebGL report a software renderer,
+    which Cloudflare treats as a bot signal.
+    Set BOT_LANG (e.g. en-GB) in .env to match the VPN country; set the timezone with
+    BOT_TZ (e.g. Europe/London), applied through launch_env().
+    """
+    flags = []
     if os.name == "posix" and os.geteuid() == 0:
-        return ["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu"]
-    return []
+        flags += ["--no-sandbox", "--disable-dev-shm-usage"]
+    lang = os.environ.get("BOT_LANG")
+    if lang:
+        flags += [f"--lang={lang}", f"--accept-lang={lang}"]
+    # no GPU on a VPS: Chrome blocklists WebGL, which Cloudflare treats as a bot signal.
+    # Force software WebGL (SwiftShader) so WebGL exists.
+    flags += ["--ignore-gpu-blocklist", "--use-gl=angle", "--use-angle=swiftshader",
+              "--enable-unsafe-swiftshader"]
+    # stop WebRTC exposing the VPS's real IP outside the VPN
+    flags += ["--force-webrtc-ip-handling-policy=disable_non_proxied_udp"]
+    return flags
+
+
+def launch_env():
+    """Environment for the Chrome process: timezone matching the VPN exit country."""
+    env = dict(os.environ)
+    if os.environ.get("BOT_TZ"):
+        env["TZ"] = os.environ["BOT_TZ"]
+    return env
 
 
 def wait_port(port, timeout=20):

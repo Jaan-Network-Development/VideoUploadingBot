@@ -57,7 +57,7 @@ def open_chrome():
         "--no-first-run", "--no-default-browser-check",
         *browser.server_flags(),
         config.POST_PAGE,
-    ])
+    ], env=browser.launch_env())
     browser.wait_port(PORT)
     try:
         cookies = json.loads(config.STATE_FILE.read_text())["cookies"]

@@ -143,7 +143,7 @@ def main():
         "--no-default-browser-check",
         *browser.server_flags(),
         config.POST_PAGE,
-    ])
+    ], env=browser.launch_env())
     try:
         browser.wait_port(PORT)
         ensure_logged_in(login, password)
