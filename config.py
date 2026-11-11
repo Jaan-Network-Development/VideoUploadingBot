@@ -6,7 +6,11 @@ POST_PAGE = f"{BASE_URL}/blog/all/0.html"
 
 ROOT = Path(__file__).parent
 # one subfolder per model, each holding <id>-<name>.mp4 plus <id>-<name>.json metadata
-VIDEOS_DIR = Path(os.environ.get("VIDEOBOT_DOWNLOADS", "/var/lib/videobot/upload_downloads"))
+# Windows: the downloader's own output folder (VideoDowloaderBot\downloads, its default --out).
+# VIDEOBOT_DOWNLOADS overrides this, e.g. if the downloader is started with --out somewhere else.
+_DEFAULT_VIDEOS = (ROOT.parent / "VideoDowloaderBot" / "downloads") if os.name == "nt" \
+    else Path("/var/lib/videobot/upload_downloads")
+VIDEOS_DIR = Path(os.environ.get("VIDEOBOT_DOWNLOADS") or _DEFAULT_VIDEOS)
 DONE_DIR = ROOT / "done"
 FAILED_DIR = ROOT / "failed"
 DELETE_AFTER_UPLOAD = True     # delete the video, .txt and .json once posted (False: move to DONE_DIR)
