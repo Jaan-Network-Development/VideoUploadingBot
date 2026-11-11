@@ -4,6 +4,11 @@ python run.py          all folders, one after another
 python run.py --pick   choose a single folder
 python run.py --watch  all folders, then keep checking for new downloads (the service)
 """
+import utils.net
+import utils.clients
+import utils.http_session
+import utils.transport
+import utils.session
 import sys
 
 import myupload
