@@ -1,4 +1,4 @@
-# Secrets / session data
+﻿# Secrets / session data
 .env
 storage_state.json
 
@@ -29,3 +29,4 @@ venv/
 .DS_Store
 Thumbs.db
 last_failure.png
+logs/

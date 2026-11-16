@@ -6,7 +6,11 @@ POST_PAGE = f"{BASE_URL}/blog/all/0.html"
 
 ROOT = Path(__file__).parent
 # one subfolder per model, each holding <id>-<name>.mp4 plus <id>-<name>.json metadata
-VIDEOS_DIR = Path(os.environ.get("VIDEOBOT_DOWNLOADS", "/var/lib/videobot/upload_downloads"))
+# Windows: the downloader's own output folder (VideoDowloaderBot\downloads, its default --out).
+# VIDEOBOT_DOWNLOADS overrides this, e.g. if the downloader is started with --out somewhere else.
+_DEFAULT_VIDEOS = (ROOT.parent / "VideoDowloaderBot" / "downloads") if os.name == "nt" \
+    else Path("/var/lib/videobot/upload_downloads")
+VIDEOS_DIR = Path(os.environ.get("VIDEOBOT_DOWNLOADS") or _DEFAULT_VIDEOS)
 DONE_DIR = ROOT / "done"
 FAILED_DIR = ROOT / "failed"
 DELETE_AFTER_UPLOAD = True     # delete the video, .txt and .json once posted (False: move to DONE_DIR)
@@ -30,3 +34,33 @@ UPLOAD_TIMEOUT = 60 * 60       # seconds to wait for a single upload
 
 IDLE_POLL_S = 60               # when the folder is empty, look again after this many seconds
 RETRY_AFTER_STOP_S = 30 * 60   # after a daily limit / not-approved stop, wait this long before retrying
+
+
+def _disable_quickedit():
+    """Windows: a click in the console starts text selection (QuickEdit), which freezes the
+    bot the next time it prints, until Esc is pressed. Turn it off for this console.
+    Runs on import, so every script (login.py, run.py, upload_*.py) gets it."""
+    if os.name != "nt":
+        return
+    try:
+        import ctypes
+        k32 = ctypes.windll.kernel32
+        handle = k32.GetStdHandle(-10)                    # STD_INPUT_HANDLE
+        mode = ctypes.c_uint32()
+        if k32.GetConsoleMode(handle, ctypes.byref(mode)):
+            ENABLE_QUICK_EDIT_MODE, ENABLE_EXTENDED_FLAGS = 0x0040, 0x0080
+            k32.SetConsoleMode(handle, (mode.value & ~ENABLE_QUICK_EDIT_MODE) | ENABLE_EXTENDED_FLAGS)
+    except Exception:
+        pass                                              # no console (service / redirected)
+
+
+_disable_quickedit()
+
+# log file (logs/uploader-<script>-<date>.log) + stuck detector; see diag.py
+import sys as _sys
+
+import diag as _diag
+
+_diag.start(f"uploader-{Path(_sys.argv[0]).stem or 'python'}", ROOT / "logs")
+_diag.add_info(lambda: f"video folder {VIDEOS_DIR}: "
+                       f"{sum(1 for p in VIDEOS_DIR.rglob('*') if p.suffix.lower() in VIDEO_EXTS)} videos")

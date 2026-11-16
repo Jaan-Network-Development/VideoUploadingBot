@@ -16,6 +16,7 @@ import httpx
 import browser
 import common
 import config
+import diag
 
 API = "https://myupload.us/api/v1"
 LINKS_PER_TXT = 5
@@ -55,6 +56,8 @@ def upload_video(client, video: Path, salt=""):
     st = video.stat()
     idem = hashlib.sha1(f"{video.name}|{st.st_size}|{st.st_mtime_ns}|{salt}".encode()).hexdigest()
     while True:
+        diag.status(f"uploading {video.name} to myupload (up to {config.UPLOAD_TIMEOUT // 60} min)",
+                    allow=config.UPLOAD_TIMEOUT + 300)
         with video.open("rb") as f:
             r = client.post(
                 f"{API}/videos",
@@ -65,7 +68,7 @@ def upload_video(client, video: Path, salt=""):
         if r.status_code == 429:
             wait = int(r.headers.get("Retry-After", "60"))
             print(f"  rate limited, waiting {wait}s")
-            time.sleep(wait)
+            diag.sleep(wait, f"myupload rate limit: waiting {wait}s")
             continue
         if r.status_code != 202 and not r.is_success:
             raise RuntimeError(f"{r.status_code} {r.text[:300]}")
@@ -91,7 +94,7 @@ def wait_ready(client, items):
                 print(f"  {name}: {status}")
                 pending.pop(name)
         if pending:
-            time.sleep(10)
+            diag.sleep(10, f"waiting for myupload to process {len(pending)} video(s)")
     if pending:
         print(f"  still processing after {READY_WAIT_S // 60} min: {', '.join(pending)}")
 
@@ -178,7 +181,8 @@ def main(folder: Path = None, watch=False):
         # after a clean pass wait for new downloads; after a stop (limit / not approved) wait longer
         wait = WATCH_INTERVAL_S if finished else STOPPED_RETRY_S
         print(f"Sleeping {wait // 60} min before checking for new videos ...", flush=True)
-        time.sleep(wait)
+        reason = "pass done" if finished else "pass STOPPED (limit / not approved / error, see above)"
+        diag.sleep(wait, f"sleeping {wait // 60} min before the next pass - {reason}")
 
 
 if __name__ == "__main__":
