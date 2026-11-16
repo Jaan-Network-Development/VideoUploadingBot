@@ -21,6 +21,7 @@ import browser
 import common
 import config
 import diag
+import myupload
 
 PORT = config.DEBUG_PORT   # one Chrome (own port + profile) per source
 CAPTCHA_WAIT_S = 5 * 60
@@ -285,7 +286,7 @@ def process_queue(folder=None):
         print(f"No new videos in {folder or config.VIDEOS_DIR}")
         return True
     for video in videos:
-        description = common.description_for(video)
+        description = myupload.description_for(video)
         print(f"\n[{config.SOURCE}] Uploading {video.name} ...")
         diag.status(f"uploading {video.name}: filling the form and attaching the file")
         try:

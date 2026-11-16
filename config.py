@@ -48,6 +48,7 @@ VIDEO_EXTS = {".mp4", ".mov", ".mkv", ".avi", ".webm", ".f4v", ".m4v"}
 # the categories as #hashtags), else this template.
 # {title} is the filename without extension, underscores/dashes turned into spaces.
 DESCRIPTION_TEMPLATE = "{title}"
+MYUPLOAD_ENABLED = True       # add myupload.us links to descriptions (needs MYUPLOAD_API_KEY in .env)
 MAX_DESCRIPTION = 500          # the textarea limit on the site
 
 DELAY_BETWEEN_UPLOADS = (15, 20)   # random seconds between uploads
