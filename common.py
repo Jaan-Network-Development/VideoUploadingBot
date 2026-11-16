@@ -23,7 +23,7 @@ class CaptchaRequired(Exception):
 def queue(folder=None, include_uploaded=False):
     """Videos in folder, oldest first, minus those already posted."""
     folder = folder or config.VIDEOS_DIR
-    folder.mkdir(exist_ok=True)
+    folder.mkdir(parents=True, exist_ok=True)
     files = [p for p in folder.iterdir() if p.suffix.lower() in config.VIDEO_EXTS]
     if not include_uploaded:
         done = _uploaded()
@@ -33,7 +33,7 @@ def queue(folder=None, include_uploaded=False):
 
 def folders():
     """Every model folder under VIDEOS_DIR, in name order (VIDEOS_DIR itself if it has none)."""
-    config.VIDEOS_DIR.mkdir(exist_ok=True)
+    config.VIDEOS_DIR.mkdir(parents=True, exist_ok=True)
     subs = sorted(p for p in config.VIDEOS_DIR.iterdir() if p.is_dir())
     return subs or [config.VIDEOS_DIR]
 
@@ -53,7 +53,7 @@ def title_for(video: Path) -> str:
     title = str(meta.get("title") or "").strip()
     if not title:
         return video.stem.replace("_", " ").replace("-", " ").strip()
-    actresses = meta.get("actresses") or []
+    actresses = meta.get("actresses") or meta.get("pornstars") or []
     actress = str(actresses[0]).strip() if actresses else ""
     if actress and not title.lower().startswith(actress.lower()):
         return f"{actress} - {title}"

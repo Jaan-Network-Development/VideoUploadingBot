@@ -20,7 +20,7 @@ import browser
 import config
 import upload_manual
 
-PORT = 9222
+PORT = config.DEBUG_PORT
 
 
 def logged_in(ctx):
@@ -128,6 +128,17 @@ def ensure_logged_in(login, password):
 
 
 def main():
+    # Plain `python login.py` = every source in config.SOURCES in parallel: one worker process per
+    # source (own Chrome window, profile and port), each logs in and then uploads its own folder.
+    # The workers are this same script with VIDEOBOT_SOURCE set. `--source NAME` runs just one.
+    if "--source" in sys.argv:
+        os.environ["VIDEOBOT_SOURCE"] = sys.argv[sys.argv.index("--source") + 1]
+        os.execv(sys.executable, [sys.executable, __file__, *[a for a in sys.argv[1:] if a not in ("--source", os.environ["VIDEOBOT_SOURCE"])]])
+    if not os.environ.get("VIDEOBOT_SOURCE") and len(config.SOURCES) > 1:
+        import run
+        run.supervise(["--watch", *[a for a in sys.argv[1:] if a == "--adblock"]],
+                      script=__file__, source_flag=False)
+        return
     browser.load_env()
     login, password = os.environ.get("SITE_LOGIN"), os.environ.get("SITE_PASSWORD")
 
@@ -136,7 +147,7 @@ def main():
     proc = subprocess.Popen([
         browser.find_chrome(),
         f"--remote-debugging-port={PORT}",
-        f"--user-data-dir={config.ROOT / 'login_profile'}",
+        f"--user-data-dir={config.CHROME_PROFILE}",
         *([f"--disable-extensions-except={config.ADBLOCK_DIR}",
            f"--load-extension={config.ADBLOCK_DIR}"] if adblock else []),
         "--no-first-run",

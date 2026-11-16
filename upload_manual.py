@@ -21,7 +21,7 @@ import browser
 import common
 import config
 
-PORT = 9222
+PORT = config.DEBUG_PORT   # one Chrome (own port + profile) per source
 CAPTCHA_WAIT_S = 5 * 60
 CAPTCHA_POLL_S = 20
 QUIT = False   # set when you answer 'q' at the manual prompt
@@ -53,7 +53,7 @@ def open_chrome():
     proc = subprocess.Popen([
         browser.find_chrome(),
         f"--remote-debugging-port={PORT}",
-        f"--user-data-dir={config.ROOT / 'login_profile'}",
+        f"--user-data-dir={config.CHROME_PROFILE}",
         "--no-first-run", "--no-default-browser-check",
         *browser.server_flags(),
         config.POST_PAGE,
@@ -249,7 +249,7 @@ def process_queue(folder=None):
         return True
     for video in videos:
         description = common.description_for(video)
-        print(f"\nUploading {video.name} ...")
+        print(f"\n[{config.SOURCE}] Uploading {video.name} ...")
         try:
             upload_auto(video, description)
             answer = ""

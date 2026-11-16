@@ -51,6 +51,12 @@ def server_flags():
     # Force software WebGL (SwiftShader) so WebGL exists.
     flags += ["--ignore-gpu-blocklist", "--use-gl=angle", "--use-angle=swiftshader",
               "--enable-unsafe-swiftshader"]
+    # two Chromes share the screen: keep an overlapped/background one running at full speed
+    # (Cloudflare's check stalls in a throttled window) and tile them side by side.
+    flags += ["--disable-features=CalculateNativeWinOcclusion",
+              "--disable-backgrounding-occluded-windows", "--disable-renderer-backgrounding",
+              "--disable-background-timer-throttling",
+              f"--window-position={config.WINDOW_SLOT * 700},0", "--window-size=1000,900"]
     # stop WebRTC exposing the VPS's real IP outside the VPN
     flags += ["--force-webrtc-ip-handling-policy=disable_non_proxied_udp"]
     return flags

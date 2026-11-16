@@ -5,12 +5,34 @@ BASE_URL = "https://sxyprn.com"
 POST_PAGE = f"{BASE_URL}/blog/all/0.html"
 
 ROOT = Path(__file__).parent
-# one subfolder per model, each holding <id>-<name>.mp4 plus <id>-<name>.json metadata
-# Windows: the downloader's own output folder (VideoDowloaderBot\downloads, its default --out).
-# VIDEOBOT_DOWNLOADS overrides this, e.g. if the downloader is started with --out somewhere else.
-_DEFAULT_VIDEOS = (ROOT.parent / "VideoDowloaderBot" / "downloads") if os.name == "nt" \
-    else Path("/var/lib/videobot/upload_downloads")
-VIDEOS_DIR = Path(os.environ.get("VIDEOBOT_DOWNLOADS") or _DEFAULT_VIDEOS)
+# Two download sources are uploaded in parallel, each by its own worker process with its own
+# Chrome (own profile + debug port) so the two never touch each other's tabs:
+#   hqporner: <id>-<name>.mp4 in one subfolder per model   (the downloader's default --out)
+#   veporn:   <id>-<name>.mp4 flat in one folder           (veporn_bot.py, default --out)
+# VIDEOBOT_DOWNLOADS / VIDEOBOT_DOWNLOADS_VEPORN override the folders.
+_DL = ROOT.parent / "VideoDowloaderBot"
+_WIN = os.name == "nt"
+SOURCES = {
+    "hqporner": {
+        "videos_dir": Path(os.environ.get("VIDEOBOT_DOWNLOADS")
+                           or (_DL / "downloads" if _WIN else "/var/lib/videobot/upload_downloads")),
+        "port": 9222, "profile": "login_profile", "slot": 0,
+    },
+    "veporn": {
+        "videos_dir": Path(os.environ.get("VIDEOBOT_DOWNLOADS_VEPORN")
+                           or (_DL / "downloads_veporn" if _WIN else "/var/lib/videobot/upload_downloads_veporn")),
+        "port": 9223, "profile": "login_profile_veporn", "slot": 1,
+    },
+}
+START_STAGGER_S = 25           # second worker starts this much later, so the two never post in lockstep
+WORKER_RESTART_S = 30          # supervisor restarts a worker that crashed after this long
+
+# This process's source: the worker sets VIDEOBOT_SOURCE; default is the first (single-browser, as before).
+SOURCE = os.environ.get("VIDEOBOT_SOURCE") or next(iter(SOURCES))
+VIDEOS_DIR = SOURCES[SOURCE]["videos_dir"]
+DEBUG_PORT = SOURCES[SOURCE]["port"]
+CHROME_PROFILE = ROOT / SOURCES[SOURCE]["profile"]
+WINDOW_SLOT = SOURCES[SOURCE]["slot"]   # windows are tiled side by side, one per slot
 DONE_DIR = ROOT / "done"
 FAILED_DIR = ROOT / "failed"
 DELETE_AFTER_UPLOAD = True     # delete the video, .txt and .json once posted (False: move to DONE_DIR)

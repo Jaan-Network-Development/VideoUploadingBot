@@ -5,6 +5,7 @@ storage_state.json
 # Browser profiles
 profile/
 login_profile/
+login_profile_veporn/
 
 # Runtime state
 history.json
