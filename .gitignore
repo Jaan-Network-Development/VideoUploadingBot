@@ -1,5 +1,4 @@
-# Secrets / session data
-.env
+﻿# Secrets / session data
 storage_state.json
 
 # Browser profiles
@@ -24,8 +23,10 @@ venv/
 .pytest_cache/
 
 # Editor / OS
-.vscode/
 .idea/
 .DS_Store
 Thumbs.db
 last_failure.png
+logs/
+config.bat
+node_modules

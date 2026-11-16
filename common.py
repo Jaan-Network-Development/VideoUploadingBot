@@ -1,8 +1,10 @@
 import json
+import os
 import random
 import re
 import shutil
 import time
+from contextlib import contextmanager
 from pathlib import Path
 
 import config
@@ -20,6 +22,7 @@ class CaptchaRequired(Exception):
     pass
 
 
+
 def queue(folder=None, include_uploaded=False):
     """Videos in folder, oldest first, minus those already posted."""
     folder = folder or config.VIDEOS_DIR
@@ -27,7 +30,7 @@ def queue(folder=None, include_uploaded=False):
     files = [p for p in folder.iterdir() if p.suffix.lower() in config.VIDEO_EXTS]
     if not include_uploaded:
         done = _uploaded()
-        files = [p for p in files if video_key(p) not in done]
+        files = [p for p in files if not is_uploaded(p, done)]
     return sorted(files, key=lambda p: p.stat().st_mtime)
 
 
@@ -100,20 +103,67 @@ def _state_file() -> Path:
     return config.VIDEOS_DIR / "state.json"
 
 
-def _read_state() -> dict:
+@contextmanager
+def _state_lock(timeout=30):
+    """Cross-process lock (state.json.lock), shared with the downloader's bot.py, so the two
+    bots never read-modify-write state.json at the same moment and lose each other's entries."""
+    lock = _state_file().with_name("state.json.lock")
+    config.VIDEOS_DIR.mkdir(parents=True, exist_ok=True)
+    end, acquired = time.time() + timeout, False
+    while not acquired:
+        try:
+            os.close(os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY))
+            acquired = True
+        except (FileExistsError, PermissionError):
+            try:
+                if time.time() - lock.stat().st_mtime > 60:   # left behind by a crash
+                    lock.unlink(missing_ok=True)
+                    continue
+            except OSError:
+                pass
+            if time.time() > end:
+                print("  warning: state.json.lock busy for 30s, writing anyway")
+                break
+            time.sleep(0.1)
     try:
-        data = json.loads(_state_file().read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return {}
-    return data if isinstance(data, dict) else {}
+        yield
+    finally:
+        if acquired:
+            lock.unlink(missing_ok=True)
+
+
+def _read_state() -> dict:
+    """state.json as a dict. Retries while the other bot is replacing the file (Windows
+    PermissionError) instead of returning {}, which would wipe both bots' history on the next write."""
+    for attempt in range(30):
+        try:
+            data = json.loads(_state_file().read_text(encoding="utf-8"))
+            return data if isinstance(data, dict) else {}
+        except FileNotFoundError:
+            return {}
+        except PermissionError:
+            if attempt == 29:
+                raise
+        except ValueError:     # only possible if written non-atomically; give it a moment
+            if attempt == 29:
+                print("  warning: state.json is corrupt, starting it fresh")
+                return {}
+        time.sleep(0.1)
 
 
 def _write_state(state: dict):
     """Rewrite state.json atomically; keys we don't own (done_videos, done_actresses) stay untouched."""
     config.VIDEOS_DIR.mkdir(parents=True, exist_ok=True)
-    tmp = _state_file().with_suffix(".json.tmp")
+    tmp = _state_file().with_name(f"state.json.{os.getpid()}.tmp")   # never the downloader's tmp
     tmp.write_text(json.dumps(state, indent=1, ensure_ascii=False), encoding="utf-8")
-    tmp.replace(_state_file())
+    for attempt in range(50):
+        try:
+            tmp.replace(_state_file())
+            return
+        except PermissionError:   # Windows: the other bot has the file open for a moment
+            if attempt == 49:
+                raise
+            time.sleep(0.1)
 
 
 def _uploaded() -> dict:
@@ -122,38 +172,78 @@ def _uploaded() -> dict:
     return up if isinstance(up, dict) else {}
 
 
+def is_uploaded(video: Path, done=None) -> bool:
+    """Posted before? Matched by site id, or by file name in case the .json is already gone."""
+    done = _uploaded() if done is None else done
+    return video_key(video) in done or any(
+        isinstance(v, dict) and v.get("file") == video.name for v in done.values())
+
+
 def record_upload(video: Path):
     """Remember a posted video in state.json so it is never uploaded again (call before finish deletes it)."""
-    state = _read_state()
-    up = state.get("uploaded_videos")
-    if not isinstance(up, dict):
-        up = {}
-    up[video_key(video)] = {
-        "file": video.name,
-        "title": title_for(video),
-        "actress": video.parent.name if video.parent != config.VIDEOS_DIR else "",
-        "time": time.strftime("%Y-%m-%d %H:%M:%S"),
-    }
-    state["uploaded_videos"] = up
-    _write_state(state)
+    with _state_lock():
+        state = _read_state()
+        up = state.get("uploaded_videos")
+        if not isinstance(up, dict):
+            up = {}
+        up[video_key(video)] = {
+            "file": video.name,
+            "title": title_for(video),
+            "actress": video.parent.name if video.parent != config.VIDEOS_DIR else "",
+            "time": time.strftime("%Y-%m-%d %H:%M:%S"),
+        }
+        state["uploaded_videos"] = up
+        _write_state(state)
 
 
 def record_actress_done(name: str):
     """Mark an actress folder as fully uploaded in state.json 'uploaded_actresses'."""
-    state = _read_state()
-    lst = state.get("uploaded_actresses")
-    if not isinstance(lst, list):
-        lst = []
-    if name not in lst:
-        lst.append(name)
-    state["uploaded_actresses"] = lst
-    _write_state(state)
+    with _state_lock():
+        state = _read_state()
+        lst = state.get("uploaded_actresses")
+        if not isinstance(lst, list):
+            lst = []
+        if name not in lst:
+            lst.append(name)
+        state["uploaded_actresses"] = lst
+        _write_state(state)
+
+
+def _unlink(f: Path, tries=20) -> bool:
+    """Delete, retrying while Chrome still holds the file open after the upload."""
+    for attempt in range(tries):
+        try:
+            f.unlink(missing_ok=True)
+            return True
+        except PermissionError:
+            time.sleep(0.5)
+    return False
+
+
+def cleanup_uploaded(folder=None):
+    """Delete videos that are already posted but still on disk (deletion failed, or a crash
+    between recording and deleting). Otherwise they sit there forever and fill the
+    downloader's --buffer, which then stops downloading."""
+    if not config.DELETE_AFTER_UPLOAD:
+        return 0
+    done = _uploaded()
+    n = 0
+    for video in queue(folder, include_uploaded=True):
+        if is_uploaded(video, done):
+            finish(video, ok=True)
+            n += 1
+    return n
 
 
 def finish(video: Path, ok: bool):
     if ok and config.DELETE_AFTER_UPLOAD:
-        for f in (video, video.with_suffix(".txt"), video.with_suffix(".json")):
-            f.unlink(missing_ok=True)
+        # the video first and the .json last: if the video can't be deleted yet, its .json
+        # (the site id) stays, so it is still recognised as uploaded and removed on the next pass
+        if not _unlink(video):
+            print(f"  could not delete {video.name} (in use); will retry on the next pass")
+            return
+        _unlink(video.with_suffix(".txt"))
+        _unlink(video.with_suffix(".json"))
         return
     dest_dir = config.DONE_DIR if ok else config.FAILED_DIR
     if video.parent != config.VIDEOS_DIR:
