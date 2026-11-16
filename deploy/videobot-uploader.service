@@ -14,6 +14,7 @@ WorkingDirectory=/home/kvm/videouploadbot
 Environment=PYTHONUNBUFFERED=1
 Environment=DISPLAY=:99
 Environment=VIDEOBOT_DOWNLOADS=/var/lib/videobot/upload_downloads
+Environment=VIDEOBOT_DOWNLOADS_VEPORN=/var/lib/videobot/upload_downloads_veporn
 # Chrome draws on the virtual display from xvfb.service
 ExecStart=/home/kvm/videouploadbot/.venv/bin/python run.py --watch
 Restart=always

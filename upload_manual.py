@@ -20,8 +20,9 @@ from playwright.sync_api import sync_playwright
 import browser
 import common
 import config
+import diag
 
-PORT = 9222
+PORT = config.DEBUG_PORT   # one Chrome (own port + profile) per source
 CAPTCHA_WAIT_S = 5 * 60
 CAPTCHA_POLL_S = 20
 QUIT = False   # set when you answer 'q' at the manual prompt
@@ -53,7 +54,7 @@ def open_chrome():
     proc = subprocess.Popen([
         browser.find_chrome(),
         f"--remote-debugging-port={PORT}",
-        f"--user-data-dir={config.ROOT / 'login_profile'}",
+        f"--user-data-dir={config.CHROME_PROFILE}",
         "--no-first-run", "--no-default-browser-check",
         *browser.server_flags(),
         config.POST_PAGE,
@@ -127,6 +128,7 @@ def attach_and_fill(video, description):
                 raise
             except Exception as e:  # noqa: BLE001
                 print(f"  ad interfered (attempt {attempt}/5): {e!r:.200}")
+                diag.log_exc(f"attach_and_fill attempt {attempt}")
                 if attempt == 5:
                     raise
         page.wait_for_function(
@@ -183,17 +185,51 @@ def wait_for_captcha():
     print(f"  Waiting for Cloudflare's check (tick it in Chrome if it asks, up to {CAPTCHA_WAIT_S // 60} min)...")
     end = time.time() + CAPTCHA_WAIT_S
     while time.time() < end:
-        time.sleep(CAPTCHA_POLL_S)
+        diag.sleep(CAPTCHA_POLL_S, "waiting for Cloudflare's check in Chrome (tick it if it asks)")
         if captcha_passed():
             return
     raise common.CaptchaRequired("Cloudflare check not finished in time")
+
+
+def upload_started(page):
+    """Has the site's progress bar started showing text (i.e. Send already went through)?"""
+    try:
+        return bool(page.evaluate(
+            "() => (document.querySelector('.addpost_mainprogressbar_wrap > span')?.innerText || '').trim()"))
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def click_send(page):
+    """Click Send; if an ad overlay blocks the real click, fire the button's click in JS."""
+    # an ad redirect makes site_page() reload the post page, which wipes the form
+    if not page.evaluate("() => typeof wantLoadVideoFile !== 'undefined' && wantLoadVideoFile === true"):
+        raise RuntimeError("post form was reset while waiting (an ad redirected the tab?)")
+    try:
+        page.click(".blog_send", timeout=10000)
+    except Exception as e:  # noqa: BLE001
+        # the click may have landed and only the wait after it timed out: never click twice
+        page.wait_for_timeout(3000)
+        if "click action done" in str(e) or upload_started(page):
+            return
+        print(f"  normal Send click failed ({e!r:.120}); clicking it via JS")
+        clicked = page.evaluate("""() => {
+            const b = document.querySelector('.blog_send');
+            if (!b) return false;
+            b.click();
+            return true;
+        }""")
+        if not clicked:
+            raise RuntimeError("Send button not found on the page")
 
 
 def send_and_wait():
     with sync_playwright() as p:
         b = p.chromium.connect_over_cdp(f"http://127.0.0.1:{PORT}")
         page = site_page(b.contexts[0])
-        page.click(".blog_send")
+        click_send(page)
+        diag.status("Send clicked - waiting for the site to finish the upload "
+                    f"(up to {config.UPLOAD_TIMEOUT // 60} min)", allow=config.UPLOAD_TIMEOUT + 300)
         page.wait_for_function(
             """() => {
                 const t = document.querySelector('.addpost_mainprogressbar_wrap > span')?.innerText || '';
@@ -232,6 +268,7 @@ def manual_fallback(video, description):
     print(f"  File: {video}")
     print("  Description copied to clipboard. In Chrome: click the post box, paste (Ctrl+V), "
           "Attach the file, tick the captcha, Send.")
+    diag.status(f"WAITING FOR YOU: answer the 'Enter = uploaded, s = skip...' prompt for {video.name}")
     while True:
         answer = input("  Enter = uploaded, s = skip, f = failed, q = quit: ").strip().lower()
         if answer in ("", "s", "f", "q"):
@@ -240,16 +277,17 @@ def manual_fallback(video, description):
 
 def process_queue(folder=None):
     """Post every pending video in folder. Returns False when the whole run should stop."""
+    removed = common.cleanup_uploaded(folder)
+    if removed:
+        print(f"{removed} video(s) were already uploaded before; removed them from the folder.")
     videos = common.queue(folder)
-    skipped = len(common.queue(folder, include_uploaded=True)) - len(videos)
-    if skipped:
-        print(f"{skipped} video(s) already uploaded before, skipping them.")
     if not videos:
         print(f"No new videos in {folder or config.VIDEOS_DIR}")
         return True
     for video in videos:
         description = common.description_for(video)
-        print(f"\nUploading {video.name} ...")
+        print(f"\n[{config.SOURCE}] Uploading {video.name} ...")
+        diag.status(f"uploading {video.name}: filling the form and attaching the file")
         try:
             upload_auto(video, description)
             answer = ""
@@ -258,6 +296,7 @@ def process_queue(folder=None):
             return False
         except Exception as e:  # noqa: BLE001
             print(f"  Automatic upload failed ({e!r}); doing this one by hand.")
+            diag.log_exc(f"automatic upload of {video.name}")
             answer = manual_fallback(video, description)
         if answer == "q":
             global QUIT
@@ -286,6 +325,7 @@ def process_all(prepare=None):
     Returns False if the run was stopped (site limit, account not approved, quit)."""
     for folder in common.folders():
         print(f"\n=== {folder.name} ===")
+        diag.status(f"=== {folder.name}: preparing / scanning the queue")
         if prepare:
             prepare(folder)
         if not process_queue(folder):
