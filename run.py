@@ -8,6 +8,8 @@ Every source in config.SOURCES (hqporner + veporn) is uploaded in parallel to th
 starts one worker process per source, each with its own Chrome window (own profile and debug port).
 python run.py --source veporn   run just one source in this process (what the workers do)
 """
+import utils.transport
+import utils.session
 import os
 import subprocess
 import sys
