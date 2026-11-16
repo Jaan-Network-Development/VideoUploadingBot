@@ -18,6 +18,7 @@ from playwright.sync_api import sync_playwright
 
 import browser
 import config
+import diag
 import upload_manual
 
 PORT = config.DEBUG_PORT
@@ -170,16 +171,20 @@ def main():
                 finished = upload_manual.process_all()
             except Exception as e:  # noqa: BLE001
                 print(f"Pass failed ({e!r}); retrying later.")
+                diag.log_exc("upload pass")
                 finished = False
             if upload_manual.QUIT:
                 break
             wait = config.IDLE_POLL_S if finished else config.RETRY_AFTER_STOP_S
+            reason = "folder done" if finished else "pass STOPPED (limit / not approved / error, see above)"
             print(f"\nWaiting {wait // 60} min for new videos (Ctrl+C to stop)...")
-            time.sleep(wait)
+            diag.sleep(wait, f"waiting {wait // 60} min before the next pass - {reason}")
+            diag.status("checking the login session")
             try:
                 ensure_logged_in(login, password)
             except Exception as e:  # noqa: BLE001
                 print(f"Login check failed ({e!r}); will retry.")
+                diag.log_exc("login check")
     except KeyboardInterrupt:
         print("Stopped.")
 
