@@ -58,6 +58,8 @@ def title_for(video: Path) -> str:
         return video.stem.replace("_", " ").replace("-", " ").strip()
     actresses = meta.get("actresses") or meta.get("pornstars") or []
     actress = str(actresses[0]).strip() if actresses else ""
+    if not actress and meta.get("channel"):   # xhaccess: "tuktuk-patrol" -> "Tuktuk Patrol"
+        actress = re.sub(r"[-_]+", " ", str(meta["channel"])).strip().title()
     if actress and not title.lower().startswith(actress.lower()):
         return f"{actress} - {title}"
     return title

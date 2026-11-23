@@ -4,7 +4,7 @@ python run.py          all folders, one after another
 python run.py --pick   choose a single folder
 python run.py --watch  all folders, then keep checking for new downloads (the service)
 
-Every source in config.SOURCES (hqporner + veporn) is uploaded in parallel to the same site: run.py
+Every source in config.SOURCES (hqporner, veporn, xhaccess) is uploaded in parallel to the same site: run.py
 starts one worker process per source, each with its own Chrome window (own profile and debug port).
 python run.py --source veporn   run just one source in this process (what the workers do)
 """

@@ -9,19 +9,33 @@ ROOT = Path(__file__).parent
 # Chrome (own profile + debug port) so the two never touch each other's tabs:
 #   hqporner: <id>-<name>.mp4 in one subfolder per model   (the downloader's default --out)
 #   veporn:   <id>-<name>.mp4 flat in one folder           (veporn_bot.py, default --out)
-# VIDEOBOT_DOWNLOADS / VIDEOBOT_DOWNLOADS_VEPORN override the folders.
+#   xhaccess: <id>-<name>.mp4 in one subfolder per channel  (xhaccess_bot.py, default --out)
+# VIDEOBOT_DOWNLOADS / VIDEOBOT_DOWNLOADS_VEPORN / VIDEOBOT_DOWNLOADS_XHACCESS override the folders.
 _DL = ROOT.parent / "VideoDowloaderBot"
 _WIN = os.name == "nt"
+_VPS = Path("/var/lib/videobot")
+
+
+def _default_dir(local: str, vps: str) -> Path:
+    """Windows, or a Linux PC without the VPS layout (/var/lib/videobot): the downloader's own folder."""
+    return _DL / local if (_WIN or not _VPS.is_dir()) else _VPS / vps
+
+
 SOURCES = {
     "hqporner": {
         "videos_dir": Path(os.environ.get("VIDEOBOT_DOWNLOADS")
-                           or (_DL / "downloads" if _WIN else "/var/lib/videobot/upload_downloads")),
+                           or _default_dir("downloads", "upload_downloads")),
         "port": 9222, "profile": "login_profile", "slot": 0,
     },
     "veporn": {
         "videos_dir": Path(os.environ.get("VIDEOBOT_DOWNLOADS_VEPORN")
-                           or (_DL / "downloads_veporn" if _WIN else "/var/lib/videobot/upload_downloads_veporn")),
+                           or _default_dir("downloads_veporn", "upload_downloads_veporn")),
         "port": 9223, "profile": "login_profile_veporn", "slot": 1,
+    },
+    "xhaccess": {
+        "videos_dir": Path(os.environ.get("VIDEOBOT_DOWNLOADS_XHACCESS")
+                           or _default_dir("downloads_xhaccess", "upload_downloads_xhaccess")),
+        "port": 9224, "profile": "login_profile_xhaccess", "slot": 2,
     },
 }
 START_STAGGER_S = 25           # second worker starts this much later, so the two never post in lockstep

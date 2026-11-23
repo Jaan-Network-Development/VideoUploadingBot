@@ -6,6 +6,7 @@ storage_state.json
 profile/
 login_profile/
 login_profile_veporn/
+login_profile_xhaccess/
 
 # Runtime state
 history.json
