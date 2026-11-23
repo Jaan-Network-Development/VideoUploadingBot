@@ -1,5 +1,10 @@
-"""myupload.us integration: upload a video by URL (the site fetches it itself, nothing is sent
-from this machine), then put the resulting share link into the post description.
+"""myupload.us integration.
+
+Two independent parts:
+  * uploading (run by myupload_worker.py, separate from the sxyprn posting): upload_pending()
+    sends every downloaded video to myupload and records it in myupload_index.json;
+  * description_for(): the sxyprn post description = normal description + the channel's 5 most
+    viewed myupload videos (fetched live from the API, never this video's own link).
 
 Needs MYUPLOAD_API_KEY in .env (Bearer key with 'Upload videos' + 'Read and list' permissions).
 
@@ -102,10 +107,10 @@ def _add_index(key, entry):
         tmp.replace(INDEX_FILE)
 
 
-def _actress_key(video: Path) -> str:
+def _actress_key(video: Path, source=None) -> str:
     """Who the 'related' links are grouped by: the actress, or the channel for xhaccess."""
     meta = common._meta(video)
-    if config.SOURCE == "xhaccess":
+    if (source or config.SOURCE) == "xhaccess":
         name = meta.get("channel") or video.parent.name
         return re.sub(r"[^0-9a-z]+", "", str(name).lower())
     names = meta.get("actresses") or meta.get("pornstars") or []
@@ -113,32 +118,53 @@ def _actress_key(video: Path) -> str:
     return re.sub(r"[^0-9a-z]+", "", str(name).lower())
 
 
-def _entry_key(video: Path) -> str:
-    return f"{config.SOURCE}:{common.video_key(video)}"
+def _entry_key(video: Path, source=None) -> str:
+    return f"{source or config.SOURCE}:{common.video_key(video)}"
 
 
-def _views(entry) -> int:
-    try:
-        return int(entry.get("views") or 0)
-    except (TypeError, ValueError):
-        return 0
+def _norm(text) -> str:
+    return re.sub(r"[^0-9a-z]+", "", str(text or "").lower())
+
+
+_ALL_CACHE = {"t": 0.0, "items": []}
+
+
+def _all_videos(max_age=300) -> list:
+    """Every ready video on the account (id, title, views, url), cached for a few minutes."""
+    if _ALL_CACHE["items"] and time.time() - _ALL_CACHE["t"] < max_age:
+        return _ALL_CACHE["items"]
+    items, page = [], 1
+    with _client() as c:
+        while page <= 200:
+            r = c.get("/videos", params={"page": page, "pageSize": 100})
+            r.raise_for_status()
+            batch = r.json().get("items", [])
+            items += [it for it in batch if it.get("status") == "ready" and it.get("url")]
+            if len(batch) < 100:
+                break
+            page += 1
+    _ALL_CACHE.update(t=time.time(), items=items)
+    return items
 
 
 def top_links(video: Path, n=TOP_N) -> list:
-    """Related myupload links (never this video): the latest n of the same actress, or for
-    xhaccess the n most viewed of the same channel (videos with 0 / unknown views fill the
-    list when fewer than n have views, so it is never left short while anything exists)."""
-    me, akey = _entry_key(video), _actress_key(video)
-    if not akey:
+    """The n most viewed myupload videos of this video's channel/actress, live from the API.
+    The video's own link is skipped (the next one is taken). Fewer than n -> fewer returned."""
+    akey = _actress_key(video)
+    if not akey or not api_key():
         return []
-    items = [(k, v) for k, v in _read_index().items()
-             if k != me and v.get("actress_key") == akey and v.get("url")]
-    if config.SOURCE == "xhaccess":
-        items = [(k, v) for k, v in items if v.get("source") == "xhaccess"]
-        items.sort(key=lambda kv: (_views(kv[1]), kv[1].get("time", "")), reverse=True)
-    else:
-        items.sort(key=lambda kv: kv[1].get("time", ""), reverse=True)
-    return [v["url"] for _, v in items[:n]]
+    own_id = (_read_index().get(_entry_key(video)) or {}).get("url", "")
+    try:
+        items = _all_videos()
+    except Exception as e:  # noqa: BLE001
+        print(f"  myupload: could not list videos ({e!r:.150}); no related links")
+        return []
+    # channel = the "<channel> - <title>" prefix (same text title_for() gave the upload)
+    same = [it for it in items
+            if _norm(str(it.get("title") or "").split(" - ", 1)[0]) == akey
+            and canon(it["url"]) != own_id]
+    same.sort(key=lambda it: (int(it.get("views") or 0), it.get("createdAt", "")), reverse=True)
+    return [canon(it["url"]) for it in same[:n]]
 
 
 # ---------------------------------------------------------------- upload by URL
@@ -235,18 +261,30 @@ def upload_file(video: Path, idem_key: str) -> dict:
         return _wait_ready(api, item)
 
 
-def ensure_link(video: Path):
-    """Myupload share url for this video (uploads it by URL the first time). None = unavailable."""
+def is_pending(video: Path, source=None) -> bool:
+    """True while this video still has to go to myupload (so its files must be kept)."""
+    if not enabled():
+        return False
+    return _entry_key(video, source) not in _read_index()
+
+
+def ensure_link(video: Path, source=None):
+    """Upload this video to myupload (once) and return its share url. None = not (yet) available."""
+    source = source or config.SOURCE
     if not enabled():
         return None
-    key = _entry_key(video)
+    key = _entry_key(video, source)
     known = _read_index().get(key)
-    if known and known.get("url"):
-        return canon(known["url"])
+    if known:
+        return canon(known["url"]) if known.get("url") else None
     meta = common._meta(video)
     src = meta.get("download_url")
-    if not src and config.SOURCE != "xhaccess":
-        print("  myupload: no download_url in the .json; skipping")
+    entry = {"title": common.title_for(video), "actress_key": _actress_key(video, source),
+             "source": source, "views": meta.get("views") or 0,
+             "time": time.strftime("%Y-%m-%d %H:%M:%S")}
+    if not src and source != "xhaccess":
+        print("  myupload: no download_url in the .json; skipping this video for good")
+        _add_index(key, {**entry, "skipped": "no download_url"})
         return None
     try:
         if src:
@@ -256,29 +294,47 @@ def ensure_link(video: Path):
             print(f"  myupload: sending the file ({video.stat().st_size / 1e6:.0f} MB) ...")
             item = upload_file(video, key)
     except Exception as e:  # noqa: BLE001
-        print(f"  myupload failed ({e!r:.200}); posting without a myupload link")
+        print(f"  myupload failed ({e!r:.200}); will retry on the next pass")
+        if "over the 1 GiB limit" in str(e):
+            _add_index(key, {**entry, "skipped": "too big"})
         return None
-    _add_index(key, {"url": canon(item["url"]), "title": common.title_for(video),
-                     "actress_key": _actress_key(video), "source": config.SOURCE,
-                     "views": meta.get("views") or 0,
-                     "time": time.strftime("%Y-%m-%d %H:%M:%S")})
+    _add_index(key, {**entry, "url": canon(item["url"])})
+    _ALL_CACHE["t"] = 0.0
     print(f"  myupload: {canon(item['url'])}")
     return canon(item["url"])
 
 
+def upload_pending() -> int:
+    """Upload every downloaded video (all sources) that is not on myupload yet, then delete the
+    files of those the sxyprn worker has already posted. Returns how many were uploaded."""
+    if not enabled():
+        return 0
+    n = 0
+    for source, cfg in config.SOURCES.items():
+        root = cfg["videos_dir"]
+        if not root.is_dir():
+            continue
+        dirs = [root] + sorted(p for p in root.iterdir() if p.is_dir())
+        for d in dirs:
+            for video in common.queue(d, include_uploaded=True):
+                key = _entry_key(video, source)
+                if key not in _read_index():
+                    print(f"[myupload:{source}] {video.name}")
+                    if ensure_link(video, source):
+                        n += 1
+                if key in _read_index() and common.is_uploaded(video):
+                    common.finish(video, ok=True)   # both sites done: now the files can go
+    return n
+
+
 # ---------------------------------------------------------------- description
 def description_for(video: Path, limit=config.MAX_DESCRIPTION) -> str:
-    """Normal description + the myupload link (+ latest 5 of the actress for hqporner,
-    + the channel's 5 most viewed for xhaccess)."""
+    """Normal description + the channel's 5 most viewed myupload videos (not this video's own link)."""
     base = common.description_for(video, limit=None)
-    url = ensure_link(video)
-    if not url:
+    more = top_links(video)
+    if not more:
         return common._fit(base, limit)
-    extra = f"\nFull video: {url}"
-    if config.SOURCE in ("hqporner", "xhaccess"):
-        more = top_links(video)
-        if more:
-            label = "More from this channel" if config.SOURCE == "xhaccess" else "More from her"
-            extra += f"\n{label}:\n" + "\n".join(more)
+    label = "More from her" if config.SOURCE == "hqporner" else "More from this channel"
+    extra = f"\n{label}:\n" + "\n".join(more)
     room = (limit or 10**6) - len(extra)
     return common._fit(base, max(room, 0)) + extra

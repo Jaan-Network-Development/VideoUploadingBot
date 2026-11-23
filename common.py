@@ -239,6 +239,9 @@ def cleanup_uploaded(folder=None):
 
 def finish(video: Path, ok: bool):
     if ok and config.DELETE_AFTER_UPLOAD:
+        import myupload   # local import: myupload imports common
+        if myupload.is_pending(video):
+            return   # not on myupload yet: the myupload worker deletes it when it has sent it
         # the video first and the .json last: if the video can't be deleted yet, its .json
         # (the site id) stays, so it is still recognised as uploaded and removed on the next pass
         if not _unlink(video):

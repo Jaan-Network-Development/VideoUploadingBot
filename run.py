@@ -15,6 +15,8 @@ import time
 
 import common
 import config
+import myupload
+from pathlib import Path
 
 WATCH_INTERVAL_S = 5 * 60      # pause between scans for new downloads
 STOPPED_RETRY_S = 60 * 60      # pause after the site refused (limit / not approved)
@@ -53,7 +55,10 @@ def supervise(passthrough, script=None, source_flag=True):
 
     def start(name):
         env = dict(os.environ, VIDEOBOT_SOURCE=name)
-        cmd = [sys.executable, script or __file__, *(["--source", name] if source_flag else []), *passthrough]
+        if name == "myupload":   # separate myupload.us uploader, independent of the sxyprn workers
+            cmd = [sys.executable, str(Path(__file__).with_name("myupload_worker.py")), *passthrough]
+        else:
+            cmd = [sys.executable, script or __file__, *(["--source", name] if source_flag else []), *passthrough]
         procs[name] = subprocess.Popen(cmd, env=env)
         print(f"[run] started worker '{name}' (pid {procs[name].pid})", flush=True)
 
@@ -62,6 +67,8 @@ def supervise(passthrough, script=None, source_flag=True):
             if i:
                 time.sleep(config.START_STAGGER_S)
             start(name)
+        if script is None and myupload.enabled():
+            start("myupload")
         while True:
             time.sleep(5)
             for name, proc in list(procs.items()):
