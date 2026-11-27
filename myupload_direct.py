@@ -1,4 +1,4 @@
-"""Send videos to myupload.us through its API WITHOUT saving them on this PC.
+"""Send videos to myupload.us through its API without keeping them on this PC.
 
   python myupload_direct.py xhaccess tuktuk-patrol [--max-videos 5] [--quality 720] [--parallel 3]
       xhaccess: only videos with the "full video" badge are sent (--all-videos for every video);
@@ -13,22 +13,22 @@ How each source gets to myupload:
   hqporner, veporn  the page's direct .mp4 link is handed to myupload (POST /videos/remote);
                     myupload fetches it itself, nothing passes through this PC.
   xhaccess          its stream links are signed for this PC's IP, so myupload cannot fetch them.
-                    The HLS segments are read here and pushed straight into a chunked (tus)
-                    upload, held in memory 50 MB at a time and never written to disk.
-                    Always sent as MP4: MPEG-TS streams are repackaged on the way with ffmpeg
-                    (stream copy, no re-encoding).
+                    Each video is saved to a temporary folder (tmp/), repackaged as an ordinary
+                    MP4 with ffmpeg (no re-encoding), uploaded and deleted straight away.
+                    Needs about 3 GB free disk per parallel upload.
 
 Every link is recorded in myupload_index.json (same index as myupload_worker.py, so nothing is
 ever sent twice). Titles are "<channel or actress> - <title>", the form the sxyprn descriptions
 use to find a channel's top videos. Needs MYUPLOAD_API_KEY in .env.
 """
 import argparse
-import itertools
 import json
+import os
 import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -246,16 +246,27 @@ def hls_pieces(xh, playlist_url, workers=8, progress: dict = None):
         raise RuntimeError("playlist has no segments")
     progress = {} if progress is None else progress
     progress.update(done=0, total=len(segs))
+    def fetch(u):
+        r = xh.get(u)
+        r.raise_for_status()        # xh.get hands back 404 pages: never put one inside a video
+        return r.content
+
     if init:
-        yield xh.get(urljoin(playlist_url, init.group(1))).content
+        yield fetch(urljoin(playlist_url, init.group(1)))
     with ThreadPoolExecutor(workers) as pool:
         for i in range(0, len(segs), workers * 3):
-            for data in pool.map(lambda u: xh.get(u).content, segs[i:i + workers * 3]):
+            for data in pool.map(fetch, segs[i:i + workers * 3]):
                 progress["done"] += 1
                 yield data
 
 
-# ---------------------------------------------------------------- MPEG-TS -> MP4, on the fly
+# ---------------------------------------------------------------- temporary file -> ordinary MP4
+# A playable MP4 needs its duration and seek index at the front, which can only be written once
+# the whole video is there, so each video is held in a temporary folder and deleted after upload.
+TMP_ROOT = Path(__file__).resolve().parent / "tmp"
+MIN_FREE = 3 * (1 << 30)     # don't start a video with less free disk than this
+
+
 def find_ffmpeg() -> str:
     exe = shutil.which("ffmpeg")
     if exe:
@@ -268,59 +279,69 @@ def find_ffmpeg() -> str:
                          "(Windows: pip install imageio-ffmpeg)")
 
 
-def mp4_pieces(pieces):
-    """Always hand on MP4. fMP4 streams (the AV1 ones) pass unchanged; MPEG-TS streams (H.264)
-    go through ffmpeg pipes: video and audio are copied, not re-encoded, nothing touches disk.
-    The output is a fragmented MP4, the only kind that can be written without seeking back."""
-    pieces = iter(pieces)
-    first = next(pieces)
-    if first[:1] != b"G":              # 0x47 is the MPEG-TS sync byte; anything else is MP4 already
-        yield first
-        yield from pieces
-        return
-    proc = subprocess.Popen(
-        [find_ffmpeg(), "-hide_banner", "-loglevel", "error", "-f", "mpegts", "-i", "pipe:0",
-         "-map", "0:v:0", "-map", "0:a:0?", "-c", "copy", "-bsf:a", "aac_adtstoasc",
-         "-movflags", "frag_keyframe+empty_moov+default_base_moof", "-f", "mp4", "pipe:1"],
-        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-    failed, errors = [], bytearray()
+def clean_leftovers():
+    """Remove temporary folders left by a run that was killed (their process is gone)."""
+    for d in TMP_ROOT.glob("video-*"):
+        pid = d.name.split("-")[1]
+        if pid.isdigit() and not _alive(int(pid)):
+            shutil.rmtree(d, ignore_errors=True)
 
-    def feed():
-        try:
-            for data in itertools.chain([first], pieces):
-                proc.stdin.write(data)
-        except BrokenPipeError:
-            pass                       # ffmpeg stopped; its exit code says why
-        except BaseException as e:     # noqa: BLE001   e.g. a segment that could not be fetched
-            failed.append(e)
-        finally:
-            try:
-                proc.stdin.close()
-            except OSError:
-                pass
 
-    def drain():                       # keep stderr empty so ffmpeg never blocks on it
-        for line in proc.stderr:
-            errors.extend(line)
-            del errors[:-2000]
-
-    threads = [threading.Thread(target=f, daemon=True) for f in (feed, drain)]
-    for t in threads:
-        t.start()
+def _alive(pid: int) -> bool:
+    if os.name == "nt":
+        return False            # Windows: a folder still in use cannot be removed anyway
     try:
-        while data := proc.stdout.read(1 << 20):
-            yield data
-        code = proc.wait()
-        for t in threads:
-            t.join(30)
-        if failed:                     # never finish an upload of a cut-off video
-            raise failed[0]
-        if code != 0:
-            raise RuntimeError(f"ffmpeg failed: {errors.decode(errors='replace')[-300:]}")
-    finally:
-        if proc.poll() is None:
-            proc.kill()
-            proc.wait()
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except OSError:
+        return True
+
+
+def make_mp4(pieces, folder: Path, tag: str, progress: dict) -> Path:
+    """Save the stream to a temporary file and repackage it as an ordinary MP4 with the index
+    first (video and audio copied, not re-encoded)."""
+    src, out = folder / "source.bin", folder / "video.mp4"
+    size, shown = 0, time.time()
+    with open(src, "wb") as f:
+        for data in pieces:
+            f.write(data)
+            size += len(data)
+            if size > MAX_BYTES * 1.2:      # MPEG-TS is a bit larger than the MP4 made from it
+                raise RuntimeError("video is over myupload's 1 GiB file limit")
+            if time.time() - shown > 15 and progress.get("total"):
+                log(f"  [{tag}] {100 * progress['done'] // progress['total']}% fetched ({size / 1e6:.0f} MB)")
+                shown = time.time()
+    r = subprocess.run([find_ffmpeg(), "-hide_banner", "-loglevel", "error", "-y", "-i", str(src),
+                        "-map", "0:v:0", "-map", "0:a:0?", "-c", "copy", "-bsf:a", "aac_adtstoasc",
+                        "-movflags", "+faststart", "-f", "mp4", str(out)],
+                       capture_output=True, text=True, errors="replace")
+    src.unlink()
+    if r.returncode != 0:
+        raise RuntimeError(f"ffmpeg failed: {r.stderr[-300:]}")
+    if out.stat().st_size > MAX_BYTES:
+        raise RuntimeError("video is over myupload's 1 GiB file limit")
+    return out
+
+
+def send_as_mp4(pieces, filename, title, tag, progress) -> dict:
+    """Fetch -> ordinary MP4 -> upload. The temporary files are removed whatever happens."""
+    TMP_ROOT.mkdir(exist_ok=True)
+    if shutil.disk_usage(TMP_ROOT).free < MIN_FREE:
+        raise RuntimeError(f"less than {MIN_FREE >> 30} GB free disk space")
+    with tempfile.TemporaryDirectory(prefix=f"video-{os.getpid()}-", dir=TMP_ROOT) as folder:
+        out = make_mp4(pieces, Path(folder), tag, progress)
+        total, sent = out.stat().st_size, {"done": 0}
+        sent["total"] = total
+
+        def read():
+            with open(out, "rb") as f:
+                while data := f.read(1 << 20):
+                    sent["done"] += len(data)
+                    yield data
+
+        return tus_stream(read(), filename, title, tag=tag, progress=sent, wait_ready=False)
 
 
 def run_xhaccess(args):
@@ -331,6 +352,7 @@ def run_xhaccess(args):
     SHOW_PROGRESS = args.parallel == 1      # \r progress bars would overwrite each other
     if not args.dry_run:
         find_ffmpeg()                       # fail now, not halfway through the first video
+        clean_leftovers()
     slug = xh.channel_slug(args.target)
     who = re.sub(r"[-_]+", " ", slug).strip().title()
     claimed, lock = set(), threading.Lock()
@@ -346,8 +368,8 @@ def run_xhaccess(args):
                 return True
             fname = f"{vid}-{xh.safe(info['title'])}.mp4"
             progress = {}
-            item = tus_stream(mp4_pieces(hls_pieces(xh, variant, progress=progress)), fname, title, tag=vid,
-                              progress=progress, wait_ready=False)   # next video starts right away
+            # next video starts right after the upload; myupload's processing isn't waited for
+            item = send_as_mp4(hls_pieces(xh, variant, progress=progress), fname, title, vid, progress)
             record(key, "xhaccess", who, title, item, info.get("views"),
                    pending=item.get("status") != "ready")
             return True

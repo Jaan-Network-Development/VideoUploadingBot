@@ -32,3 +32,8 @@ venv/
 Thumbs.db
 last_failure.png
 logs/
+
+tmp/
+
+broken_videos.json
+myupload_index.backup-*.json
