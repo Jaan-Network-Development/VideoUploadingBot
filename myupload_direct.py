@@ -21,6 +21,7 @@ ever sent twice). Titles are "<channel or actress> - <title>", the form the sxyp
 use to find a channel's top videos. Needs MYUPLOAD_API_KEY in .env.
 """
 import argparse
+import json
 import re
 import sys
 import time
@@ -53,12 +54,55 @@ def already(key: str) -> bool:
     return key in myupload._read_index()
 
 
-def record(key, source, group, title, item, views=0):
+def record(key, source, group, title, item, views=0, pending=False):
     url = myupload.canon(item["url"])
-    myupload._add_index(key, {"url": url, "title": title, "actress_key": myupload._norm(group),
-                              "source": source, "views": views or 0,
-                              "time": time.strftime("%Y-%m-%d %H:%M:%S")})
-    log(f"  -> {url}")
+    entry = {"url": url, "title": title, "actress_key": myupload._norm(group),
+             "source": source, "views": views or 0, "time": time.strftime("%Y-%m-%d %H:%M:%S")}
+    if pending:
+        entry.update(pending=True, id=item["id"])
+    myupload._add_index(key, entry)
+    log(f"  -> {url}" + ("  (processing on myupload)" if pending else ""))
+
+
+# ---------------------------------------------------------------- processing, checked in the background
+CHECK_EVERY_S = 20
+FINAL_WAIT_S = 30 * 60      # after the last upload, how long to keep watching unfinished processing
+
+
+def drop_record(key):
+    with myupload._lock(myupload.INDEX_FILE.with_suffix(".lock")):
+        data = myupload._read_index()
+        if data.pop(key, None) is not None:
+            myupload.INDEX_FILE.write_text(json.dumps(data, indent=1, ensure_ascii=False), encoding="utf-8")
+
+
+def check_pending() -> int:
+    """Look at every video recorded as still processing. Ready: mark it done. Failed or deleted on
+    myupload: forget it, so a later run sends it again. Returns how many are still processing."""
+    waiting = {k: v for k, v in myupload._read_index().items() if v.get("pending")}
+    left = 0
+    for key, entry in waiting.items():
+        try:
+            with myupload._client() as c:
+                r = c.get(f"/videos/{entry['id']}")
+            if r.status_code == 404:
+                item = {"status": "failed", "disabledReason": "no longer on myupload"}
+            else:
+                r.raise_for_status()
+                item = r.json().get("file", r.json())
+            if item.get("status") == "ready":
+                entry.pop("pending")
+                myupload._add_index(key, entry)
+                log(f"  ready: {entry['url']}  {entry['title'][:60]}")
+            elif item.get("status") in ("failed", "disabled"):
+                drop_record(key)
+                log(f"  FAILED on myupload {key}: {item.get('disabledReason')} (will be sent again next run)")
+            else:
+                left += 1
+        except Exception as e:  # noqa: BLE001   a network hiccup: check again later
+            log(f"  could not check {key}: {str(e)[:80]}")
+            left += 1
+    return left
 
 
 # ---------------------------------------------------------------- streaming tus upload
@@ -73,7 +117,8 @@ def progress_text(uploaded: int, buffered: int, progress: dict) -> str:
             f"({uploaded / 1e6:.0f} MB of ~{estimate / 1e6:.0f} MB)")
 
 
-def tus_stream(chunks, filename: str, title: str, tag: str = "", progress: dict = None) -> dict:
+def tus_stream(chunks, filename: str, title: str, tag: str = "", progress: dict = None,
+               wait_ready: bool = True) -> dict:
     """Push an iterator of byte pieces to myupload over tus (length unknown up front)."""
     progress = {} if progress is None else progress
     hdr = {"Authorization": f"Bearer {myupload.api_key()}", "Tus-Resumable": "1.0.0"}
@@ -139,7 +184,7 @@ def tus_stream(chunks, filename: str, title: str, tag: str = "", progress: dict 
                 item = max(new, key=lambda v: v.get("createdAt", ""))
         if item is None:
             raise RuntimeError("uploaded but the item never showed up in the list")
-        return myupload._wait_ready(api, item)
+        return myupload._wait_ready(api, item) if wait_ready else item
 
 
 # ---------------------------------------------------------------- xhaccess (streamed through here)
@@ -227,12 +272,23 @@ def run_xhaccess(args):
             fname = f"{vid}-{xh.safe(info['title'])}.mp4"
             progress = {}
             item = tus_stream(hls_pieces(xh, variant, progress=progress), fname, title, tag=vid,
-                              progress=progress)
-            record(key, "xhaccess", who, title, item, info.get("views"))
+                              progress=progress, wait_ready=False)   # next video starts right away
+            record(key, "xhaccess", who, title, item, info.get("views"),
+                   pending=item.get("status") != "ready")
             return True
         except Exception as e:  # noqa: BLE001
             log(f"  FAILED {vid}: {e}")
             return False
+
+    uploads_done = threading.Event()
+
+    def watch():
+        while not uploads_done.wait(CHECK_EVERY_S):
+            check_pending()
+
+    if not args.dry_run:
+        check_pending()          # leftovers from an earlier run
+        threading.Thread(target=watch, daemon=True).start()
 
     n, running = 0, set()
     with ThreadPoolExecutor(args.parallel) as pool:
@@ -251,6 +307,12 @@ def run_xhaccess(args):
             if len(running) >= args.parallel:       # keep N in flight, start the next as one ends
                 done, running = wait(running, return_when=FIRST_COMPLETED)
         wait(running)
+    uploads_done.set()
+    if not args.dry_run:
+        end = time.time() + FINAL_WAIT_S
+        while (left := check_pending()) and time.time() < end:
+            log(f"  waiting for myupload to process {left} video(s) ...")
+            time.sleep(60)
     log(f"[{slug}] done, {n} video(s)")
 
 
