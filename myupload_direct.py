@@ -1,6 +1,6 @@
-"""Send videos to myupload.us through its API without keeping them on this PC.
+"""Send videos to myupload.us through its API WITHOUT saving them on this PC.
 
-  python myupload_direct.py xhaccess tuktuk-patrol [--max-videos 5] [--quality 720] [--parallel 3]
+  python myupload_direct.py xhaccess tuktuk-patrol [--max-videos 5] [--quality 720]
       xhaccess: only videos with the "full video" badge are sent (--all-videos for every video);
       there is no length limit
   python myupload_direct.py hqporner --actress little-caprice [--max-videos 5]
@@ -13,9 +13,9 @@ How each source gets to myupload:
   hqporner, veporn  the page's direct .mp4 link is handed to myupload (POST /videos/remote);
                     myupload fetches it itself, nothing passes through this PC.
   xhaccess          its stream links are signed for this PC's IP, so myupload cannot fetch them.
-                    Each video is saved to a temporary folder (tmp/), repackaged as an ordinary
-                    MP4 with ffmpeg (no re-encoding), uploaded and deleted straight away.
-                    Needs about 3 GB free disk per parallel upload.
+                    The HLS segments are read here and pushed straight into a chunked (tus)
+                    upload, never written to disk and not converted. One video at a time: the next
+                    starts when myupload has finished processing the previous one.
 
 Every link is recorded in myupload_index.json (same index as myupload_worker.py, so nothing is
 ever sent twice). Titles are "<channel or actress> - <title>", the form the sxyprn descriptions
@@ -23,13 +23,8 @@ use to find a channel's top videos. Needs MYUPLOAD_API_KEY in .env.
 """
 import argparse
 import json
-import os
 import re
-import shutil
-import subprocess
 import sys
-import tempfile
-import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -70,9 +65,8 @@ def record(key, source, group, title, item, views=0, pending=False):
     log(f"  -> {url}" + ("  (processing on myupload)" if pending else ""))
 
 
-# ---------------------------------------------------------------- processing, checked in the background
+# ---------------------------------------------------------------- myupload processing
 CHECK_EVERY_S = 20
-FINAL_WAIT_S = 30 * 60      # after the last upload, how long to keep watching unfinished processing
 
 
 def drop_record(key):
@@ -82,33 +76,50 @@ def drop_record(key):
             myupload.INDEX_FILE.write_text(json.dumps(data, indent=1, ensure_ascii=False), encoding="utf-8")
 
 
-def check_pending() -> int:
-    """Look at every video recorded as still processing. Ready: mark it done. Failed or deleted on
-    myupload: forget it, so a later run sends it again. Returns how many are still processing."""
-    waiting = {k: v for k, v in myupload._read_index().items() if v.get("pending")}
-    left = 0
-    for key, entry in waiting.items():
-        try:
-            with myupload._client() as c:
-                r = c.get(f"/videos/{entry['id']}")
-            if r.status_code == 404:
-                item = {"status": "failed", "disabledReason": "no longer on myupload"}
-            else:
-                r.raise_for_status()
-                item = r.json().get("file", r.json())
-            if item.get("status") == "ready":
-                entry.pop("pending")
-                myupload._add_index(key, entry)
-                log(f"  ready: {entry['url']}  {entry['title'][:60]}")
-            elif item.get("status") in ("failed", "disabled"):
-                drop_record(key)
-                log(f"  FAILED on myupload {key}: {item.get('disabledReason')} (will be sent again next run)")
-            else:
-                left += 1
-        except Exception as e:  # noqa: BLE001   a network hiccup: check again later
-            log(f"  could not check {key}: {str(e)[:80]}")
-            left += 1
-    return left
+def check_one(key, entry) -> str:
+    """One look at a video recorded as processing: 'ready' (marked done), 'failed' (forgotten, so a
+    later run sends it again) or 'processing'."""
+    try:
+        with myupload._client() as c:
+            r = c.get(f"/videos/{entry['id']}")
+        if r.status_code == 404:
+            item = {"status": "failed", "disabledReason": "no longer on myupload"}
+        else:
+            r.raise_for_status()
+            item = r.json().get("file", r.json())
+    except Exception as e:  # noqa: BLE001   a network hiccup: check again later
+        log(f"  could not check {key}: {str(e)[:80]}")
+        return "processing"
+    if item.get("status") == "ready":
+        entry.pop("pending", None)
+        myupload._add_index(key, entry)
+        log(f"  ready: {entry['url']}  {entry['title'][:60]}")
+        return "ready"
+    if item.get("status") in ("failed", "disabled"):
+        drop_record(key)
+        log(f"  FAILED on myupload {key}: {item.get('disabledReason')} (will be sent again next run)")
+        return "failed"
+    return "processing"
+
+
+def check_pending():
+    """Look once at anything an earlier run left processing."""
+    for key, entry in myupload._read_index().items():
+        if entry.get("pending"):
+            check_one(key, entry)
+
+
+def wait_processed(key):
+    """Block until myupload has finished processing this video (no time limit)."""
+    start, shown = time.time(), time.time()
+    while True:
+        entry = myupload._read_index().get(key)
+        if not entry or not entry.get("pending") or check_one(key, entry) != "processing":
+            return
+        if time.time() - shown >= 60:
+            log(f"  still processing after {(time.time() - start) / 60:.0f} min, waiting ...")
+            shown = time.time()
+        time.sleep(CHECK_EVERY_S)
 
 
 # ---------------------------------------------------------------- streaming tus upload
@@ -260,156 +271,42 @@ def hls_pieces(xh, playlist_url, workers=8, progress: dict = None):
                 yield data
 
 
-# ---------------------------------------------------------------- temporary file -> ordinary MP4
-# A playable MP4 needs its duration and seek index at the front, which can only be written once
-# the whole video is there, so each video is held in a temporary folder and deleted after upload.
-TMP_ROOT = Path(__file__).resolve().parent / "tmp"
-MIN_FREE = 3 * (1 << 30)     # don't start a video with less free disk than this
-
-
-def find_ffmpeg() -> str:
-    exe = shutil.which("ffmpeg")
-    if exe:
-        return exe
-    try:
-        import imageio_ffmpeg
-        return imageio_ffmpeg.get_ffmpeg_exe()
-    except Exception:  # noqa: BLE001
-        raise SystemExit("ffmpeg is needed to send MP4 files: sudo apt install ffmpeg "
-                         "(Windows: pip install imageio-ffmpeg)")
-
-
-def clean_leftovers():
-    """Remove temporary folders left by a run that was killed (their process is gone)."""
-    for d in TMP_ROOT.glob("video-*"):
-        pid = d.name.split("-")[1]
-        if pid.isdigit() and not _alive(int(pid)):
-            shutil.rmtree(d, ignore_errors=True)
-
-
-def _alive(pid: int) -> bool:
-    if os.name == "nt":
-        return False            # Windows: a folder still in use cannot be removed anyway
-    try:
-        os.kill(pid, 0)
-        return True
-    except ProcessLookupError:
-        return False
-    except OSError:
-        return True
-
-
-def make_mp4(pieces, folder: Path, tag: str, progress: dict) -> Path:
-    """Save the stream to a temporary file and repackage it as an ordinary MP4 with the index
-    first (video and audio copied, not re-encoded)."""
-    src, out = folder / "source.bin", folder / "video.mp4"
-    size, shown = 0, time.time()
-    with open(src, "wb") as f:
-        for data in pieces:
-            f.write(data)
-            size += len(data)
-            if size > MAX_BYTES * 1.2:      # MPEG-TS is a bit larger than the MP4 made from it
-                raise RuntimeError("video is over myupload's 1 GiB file limit")
-            if time.time() - shown > 15 and progress.get("total"):
-                log(f"  [{tag}] {100 * progress['done'] // progress['total']}% fetched ({size / 1e6:.0f} MB)")
-                shown = time.time()
-    r = subprocess.run([find_ffmpeg(), "-hide_banner", "-loglevel", "error", "-y", "-i", str(src),
-                        "-map", "0:v:0", "-map", "0:a:0?", "-c", "copy", "-bsf:a", "aac_adtstoasc",
-                        "-movflags", "+faststart", "-f", "mp4", str(out)],
-                       capture_output=True, text=True, errors="replace")
-    src.unlink()
-    if r.returncode != 0:
-        raise RuntimeError(f"ffmpeg failed: {r.stderr[-300:]}")
-    if out.stat().st_size > MAX_BYTES:
-        raise RuntimeError("video is over myupload's 1 GiB file limit")
-    return out
-
-
-def send_as_mp4(pieces, filename, title, tag, progress) -> dict:
-    """Fetch -> ordinary MP4 -> upload. The temporary files are removed whatever happens."""
-    TMP_ROOT.mkdir(exist_ok=True)
-    if shutil.disk_usage(TMP_ROOT).free < MIN_FREE:
-        raise RuntimeError(f"less than {MIN_FREE >> 30} GB free disk space")
-    with tempfile.TemporaryDirectory(prefix=f"video-{os.getpid()}-", dir=TMP_ROOT) as folder:
-        out = make_mp4(pieces, Path(folder), tag, progress)
-        total, sent = out.stat().st_size, {"done": 0}
-        sent["total"] = total
-
-        def read():
-            with open(out, "rb") as f:
-                while data := f.read(1 << 20):
-                    sent["done"] += len(data)
-                    yield data
-
-        return tus_stream(read(), filename, title, tag=tag, progress=sent, wait_ready=False)
-
-
 def run_xhaccess(args):
-    """Send a channel's videos, --parallel N at a time (each one streams through this PC on its own)."""
-    from concurrent.futures import FIRST_COMPLETED, wait
+    """Send a channel's videos one by one: upload, wait until myupload has processed it, then next."""
     import xhaccess_bot as xh
-    global SHOW_PROGRESS
-    SHOW_PROGRESS = args.parallel == 1      # \r progress bars would overwrite each other
-    if not args.dry_run:
-        find_ffmpeg()                       # fail now, not halfway through the first video
-        clean_leftovers()
     slug = xh.channel_slug(args.target)
     who = re.sub(r"[-_]+", " ", slug).strip().title()
-    claimed, lock = set(), threading.Lock()
-
-    def one(it):
+    if args.parallel != 1:
+        log("--parallel is ignored: videos are sent one at a time")
+    if not args.dry_run:
+        check_pending()          # leftovers from an earlier run (not waited for)
+    n, seen = 0, set()
+    for it in xh.channel_videos(slug):
+        if args.max_videos and n >= args.max_videos:
+            break
         vid, key = str(it["id"]), f"xhaccess:{it['id']}"
+        if not (args.all_videos or it.get("hasProducerBadge")):
+            continue      # only videos with the "full video" badge; no length limit
+        if key in seen or already(key):
+            continue
+        seen.add(key)
+        n += 1
         try:
             info = xh.scrape_video(it["pageURL"])
             variant, height = pick_variant(xh, info["master"], args.quality)
             title = title_of(who, info["title"])
             log(f"{vid} '{title}' {info['duration'] // 60} min, {height}p")
             if args.dry_run:
-                return True
+                continue
             fname = f"{vid}-{xh.safe(info['title'])}.mp4"
             progress = {}
-            # next video starts right after the upload; myupload's processing isn't waited for
-            item = send_as_mp4(hls_pieces(xh, variant, progress=progress), fname, title, vid, progress)
-            record(key, "xhaccess", who, title, item, info.get("views"),
-                   pending=item.get("status") != "ready")
-            return True
+            item = tus_stream(hls_pieces(xh, variant, progress=progress), fname, title, tag=vid,
+                              progress=progress, wait_ready=False)
+            # recorded at once, so stopping during processing never uploads it twice
+            record(key, "xhaccess", who, title, item, info.get("views"), pending=True)
+            wait_processed(key)
         except Exception as e:  # noqa: BLE001
             log(f"  FAILED {vid}: {e}")
-            return False
-
-    uploads_done = threading.Event()
-
-    def watch():
-        while not uploads_done.wait(CHECK_EVERY_S):
-            check_pending()
-
-    if not args.dry_run:
-        check_pending()          # leftovers from an earlier run
-        threading.Thread(target=watch, daemon=True).start()
-
-    n, running = 0, set()
-    with ThreadPoolExecutor(args.parallel) as pool:
-        for it in xh.channel_videos(slug):
-            if args.max_videos and n >= args.max_videos:
-                break
-            key = f"xhaccess:{it['id']}"
-            if not (args.all_videos or it.get("hasProducerBadge")):
-                continue      # only videos with the "full video" badge; no length limit
-            with lock:
-                if already(key) or key in claimed:
-                    continue
-                claimed.add(key)
-            n += 1
-            running.add(pool.submit(one, it))
-            if len(running) >= args.parallel:       # keep N in flight, start the next as one ends
-                done, running = wait(running, return_when=FIRST_COMPLETED)
-        wait(running)
-    uploads_done.set()
-    if not args.dry_run:
-        end = time.time() + FINAL_WAIT_S
-        while (left := check_pending()) and time.time() < end:
-            log(f"  waiting for myupload to process {left} video(s) ...")
-            time.sleep(60)
     log(f"[{slug}] done, {n} video(s)")
 
 
@@ -530,7 +427,7 @@ def main():
     h.add_argument("--actress", nargs="*", help="actress slug(s), e.g. little-caprice")
     v = sub.add_parser("veporn"); v.add_argument("urls", nargs="*", help="video page URLs")
     v.add_argument("--latest", type=int, default=0, help="the N newest videos on veporn")
-    x.add_argument("--parallel", type=int, default=1, help="videos sent at the same time (default 1)")
+    x.add_argument("--parallel", type=int, default=1, help=argparse.SUPPRESS)   # ignored
     x.add_argument("--all-videos", action="store_true",
                    help='also send videos without the "full video" badge (default: badge only)')
     for s in (x, h, v):
