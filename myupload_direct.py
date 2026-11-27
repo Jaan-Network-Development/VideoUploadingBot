@@ -15,15 +15,21 @@ How each source gets to myupload:
   xhaccess          its stream links are signed for this PC's IP, so myupload cannot fetch them.
                     The HLS segments are read here and pushed straight into a chunked (tus)
                     upload, held in memory 50 MB at a time and never written to disk.
+                    Always sent as MP4: MPEG-TS streams are repackaged on the way with ffmpeg
+                    (stream copy, no re-encoding).
 
 Every link is recorded in myupload_index.json (same index as myupload_worker.py, so nothing is
 ever sent twice). Titles are "<channel or actress> - <title>", the form the sxyprn descriptions
 use to find a channel's top videos. Needs MYUPLOAD_API_KEY in .env.
 """
 import argparse
+import itertools
 import json
 import re
+import shutil
+import subprocess
 import sys
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -249,13 +255,82 @@ def hls_pieces(xh, playlist_url, workers=8, progress: dict = None):
                 yield data
 
 
+# ---------------------------------------------------------------- MPEG-TS -> MP4, on the fly
+def find_ffmpeg() -> str:
+    exe = shutil.which("ffmpeg")
+    if exe:
+        return exe
+    try:
+        import imageio_ffmpeg
+        return imageio_ffmpeg.get_ffmpeg_exe()
+    except Exception:  # noqa: BLE001
+        raise SystemExit("ffmpeg is needed to send MP4 files: sudo apt install ffmpeg "
+                         "(Windows: pip install imageio-ffmpeg)")
+
+
+def mp4_pieces(pieces):
+    """Always hand on MP4. fMP4 streams (the AV1 ones) pass unchanged; MPEG-TS streams (H.264)
+    go through ffmpeg pipes: video and audio are copied, not re-encoded, nothing touches disk.
+    The output is a fragmented MP4, the only kind that can be written without seeking back."""
+    pieces = iter(pieces)
+    first = next(pieces)
+    if first[:1] != b"G":              # 0x47 is the MPEG-TS sync byte; anything else is MP4 already
+        yield first
+        yield from pieces
+        return
+    proc = subprocess.Popen(
+        [find_ffmpeg(), "-hide_banner", "-loglevel", "error", "-f", "mpegts", "-i", "pipe:0",
+         "-map", "0:v:0", "-map", "0:a:0?", "-c", "copy", "-bsf:a", "aac_adtstoasc",
+         "-movflags", "frag_keyframe+empty_moov+default_base_moof", "-f", "mp4", "pipe:1"],
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    failed, errors = [], bytearray()
+
+    def feed():
+        try:
+            for data in itertools.chain([first], pieces):
+                proc.stdin.write(data)
+        except BrokenPipeError:
+            pass                       # ffmpeg stopped; its exit code says why
+        except BaseException as e:     # noqa: BLE001   e.g. a segment that could not be fetched
+            failed.append(e)
+        finally:
+            try:
+                proc.stdin.close()
+            except OSError:
+                pass
+
+    def drain():                       # keep stderr empty so ffmpeg never blocks on it
+        for line in proc.stderr:
+            errors.extend(line)
+            del errors[:-2000]
+
+    threads = [threading.Thread(target=f, daemon=True) for f in (feed, drain)]
+    for t in threads:
+        t.start()
+    try:
+        while data := proc.stdout.read(1 << 20):
+            yield data
+        code = proc.wait()
+        for t in threads:
+            t.join(30)
+        if failed:                     # never finish an upload of a cut-off video
+            raise failed[0]
+        if code != 0:
+            raise RuntimeError(f"ffmpeg failed: {errors.decode(errors='replace')[-300:]}")
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait()
+
+
 def run_xhaccess(args):
     """Send a channel's videos, --parallel N at a time (each one streams through this PC on its own)."""
-    import threading
     from concurrent.futures import FIRST_COMPLETED, wait
     import xhaccess_bot as xh
     global SHOW_PROGRESS
     SHOW_PROGRESS = args.parallel == 1      # \r progress bars would overwrite each other
+    if not args.dry_run:
+        find_ffmpeg()                       # fail now, not halfway through the first video
     slug = xh.channel_slug(args.target)
     who = re.sub(r"[-_]+", " ", slug).strip().title()
     claimed, lock = set(), threading.Lock()
@@ -271,7 +346,7 @@ def run_xhaccess(args):
                 return True
             fname = f"{vid}-{xh.safe(info['title'])}.mp4"
             progress = {}
-            item = tus_stream(hls_pieces(xh, variant, progress=progress), fname, title, tag=vid,
+            item = tus_stream(mp4_pieces(hls_pieces(xh, variant, progress=progress)), fname, title, tag=vid,
                               progress=progress, wait_ready=False)   # next video starts right away
             record(key, "xhaccess", who, title, item, info.get("views"),
                    pending=item.get("status") != "ready")
