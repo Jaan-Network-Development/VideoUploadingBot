@@ -62,8 +62,20 @@ def record(key, source, group, title, item, views=0):
 
 
 # ---------------------------------------------------------------- streaming tus upload
-def tus_stream(chunks, filename: str, title: str, tag: str = "") -> dict:
+def progress_text(uploaded: int, buffered: int, progress: dict) -> str:
+    """'42% uploaded (210 MB of ~500 MB)'. The size isn't known up front, so the total is
+    estimated from how much of the video has been read (progress: done / total)."""
+    done, total = progress.get("done", 0), progress.get("total", 0)
+    if not (done and total and uploaded + buffered):
+        return f"uploaded {uploaded / 1e6:.0f} MB"
+    estimate = (uploaded + buffered) * total / done
+    return (f"{min(100 * uploaded / estimate, 100):.0f}% uploaded "
+            f"({uploaded / 1e6:.0f} MB of ~{estimate / 1e6:.0f} MB)")
+
+
+def tus_stream(chunks, filename: str, title: str, tag: str = "", progress: dict = None) -> dict:
     """Push an iterator of byte pieces to myupload over tus (length unknown up front)."""
+    progress = {} if progress is None else progress
     hdr = {"Authorization": f"Bearer {myupload.api_key()}", "Tus-Resumable": "1.0.0"}
     meta = ",".join(f"{k} {myupload._b64(v)}" for k, v in (
         ("filename", filename), ("filetype", "video/mp4"), ("kind", "video"), ("title", title)))
@@ -101,8 +113,8 @@ def tus_stream(chunks, filename: str, title: str, tag: str = "") -> dict:
                     del buf[:TUS_CHUNK]
                 if offset + len(buf) > MAX_BYTES:
                     raise RuntimeError("video is over myupload's 1 GiB file limit")
-                if time.time() - shown > (5 if SHOW_PROGRESS else 60):
-                    msg = f"sent {(offset + len(buf)) / 1e6:.0f} MB"
+                if time.time() - shown > (5 if SHOW_PROGRESS else 15):
+                    msg = progress_text(offset, len(buf), progress)
                     if SHOW_PROGRESS:
                         print(f"\r    {msg}", end="", flush=True)
                     else:
@@ -111,6 +123,7 @@ def tus_stream(chunks, filename: str, title: str, tag: str = "") -> dict:
             send(bytes(buf), final=True)
             if SHOW_PROGRESS:
                 print()
+            log(f"  [{tag or filename}] 100% uploaded ({offset / 1e6:.0f} MB), waiting for myupload to process it")
         except BaseException:
             try:
                 up.delete(loc, headers=hdr)   # drop the half-finished upload
@@ -173,18 +186,22 @@ def open_browser(p):
         return p.chromium.launch(headless=True)
 
 
-def hls_pieces(xh, playlist_url, workers=8):
+def hls_pieces(xh, playlist_url, workers=8, progress: dict = None):
     """Init segment, then every media segment in order, fetched in parallel."""
     text = xh.get(playlist_url).text
     init = re.search(r'#EXT-X-MAP:URI="([^"]+)"', text)
     segs = [urljoin(playlist_url, s) for s in re.findall(r"^(?!#)\S+", text, re.M)]
     if not segs:
         raise RuntimeError("playlist has no segments")
+    progress = {} if progress is None else progress
+    progress.update(done=0, total=len(segs))
     if init:
         yield xh.get(urljoin(playlist_url, init.group(1))).content
     with ThreadPoolExecutor(workers) as pool:
         for i in range(0, len(segs), workers * 3):
-            yield from pool.map(lambda u: xh.get(u).content, segs[i:i + workers * 3])
+            for data in pool.map(lambda u: xh.get(u).content, segs[i:i + workers * 3]):
+                progress["done"] += 1
+                yield data
 
 
 def run_xhaccess(args):
@@ -208,7 +225,9 @@ def run_xhaccess(args):
             if args.dry_run:
                 return True
             fname = f"{vid}-{xh.safe(info['title'])}.mp4"
-            item = tus_stream(hls_pieces(xh, variant), fname, title, tag=vid)
+            progress = {}
+            item = tus_stream(hls_pieces(xh, variant, progress=progress), fname, title, tag=vid,
+                              progress=progress)
             record(key, "xhaccess", who, title, item, info.get("views"))
             return True
         except Exception as e:  # noqa: BLE001
